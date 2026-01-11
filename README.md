@@ -4,6 +4,7 @@
 Albireo is designed to deter the vast majority of automated crawlers on the web.
 It is not intended to defeat highly resourced or targeted scraping operations.
 
+designed specifically for Cloudflare Pages
 ## Setup
 
 1. Copy \`functions\` folder to your project.
