@@ -10,6 +10,7 @@ It is **not intended to defeat highly resourced or targeted scraping operations*
 ## Why Albireo?
 
 Many static sites (GitHub Pages, Netlify, Vercel) **cannot run traditional anti-crawler systems** like Anubis, which require a server or reverse proxy.  
+(Now only support Pages)
 
 Albireo allows you to:
 
