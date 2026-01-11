@@ -1,6 +1,8 @@
 # Albireo 🛡️
 
 **Albireo** is a serverless Proof-of-Work (PoW) protection for Cloudflare Pages, based on Anubis.
+Albireo is designed to deter the vast majority of automated crawlers on the web.
+It is not intended to defeat highly resourced or targeted scraping operations.
 
 ## Setup
 
