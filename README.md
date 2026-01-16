@@ -10,7 +10,7 @@ It is **not intended to defeat highly resourced or targeted scraping operations*
 ## Why Albireo?
 
 Many static sites (GitHub Pages, Netlify, Vercel) **cannot run traditional anti-crawler systems** like Anubis, which require a server or reverse proxy.  
-(Now only support Pages)
+(Now only support Pages and Netlify)
 
 Albireo allows you to:
 
@@ -24,7 +24,7 @@ Albireo allows you to:
 
 ---
 
-## Setup
+## Setup(Cloudflare pages)
 
 1. Copy the `functions` folder to your Cloudflare Pages project  
 2. Change `SECRET_KEY` in `_middleware.ts`  
@@ -33,6 +33,18 @@ Albireo allows you to:
    - `happy.webp`  
    - `reject.webp`  
 
+## Setup(Netlify)
+
+Use this if your site is hosted on Netlify.
+1. Copy Files: Go to the For_Netlify folder in this repo, and copy all its contents (netlify/, netlify.toml) to the root of your own project.
+- Your project root should now have a netlify.toml file and a netlify folder.
+2. Configure Secret:
+- Open netlify/edge-functions/albireo.ts.
+- Find SECRET_KEY and change it to a random string (Security Requirement).
+3. Add Images:
+- Create a folder public/anubis-dist/img/ in your project (or ensure public exists).
+- Add your mascot images: pensive.webp, happy.webp, reject.webp.
+4. Deploy: Push to your repository. Netlify will automatically detect the Edge Functions via netlify.toml.
 ---
 
 ## Configuration
