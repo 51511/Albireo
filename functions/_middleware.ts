@@ -2,18 +2,12 @@ interface Env {
   ASSETS: Fetcher;
 }
 
-// === 設定區 (Configuration) ===
-// 難度 5：電腦約 0.5~1 秒，手機約 2~5 秒 (推薦)
-const DIFFICULTY = 5; 
-
-// ★★★ 安全警告 (Security Warning) ★★★
-// 上傳後請務必修改此 Key / Please change this key after deployment
-const SECRET_KEY = "ALBIREO_DEFAULT_SECRET_KEY_CHANGE_ME";
-
-// SEO 白名單 (SEO Whitelist)
+// === Configuration ===
+const DIFFICULTY = 5;
+const SECRET_KEY = "ALBIREO_DEFAULT_SECRET_KEY_CHANGE_ME"; // ★ 請務必修改這裡
 const BOT_AGENTS = ["google", "bingbot", "yahoo", "duckduckbot"];
 
-// === 加密工具 (Crypto Utils) ===
+// === Crypto Utils ===
 async function sign(msg: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(SECRET_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -39,17 +33,17 @@ async function checkPoW(challenge: string, nonce: string, response: string, diff
   return true;
 }
 
-// === HTML 生成器 (HTML Generator) ===
+// === HTML Generator ===
 const GENERATE_HTML = (challenge: string) => `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <title>Security Check | Albireo</title>
-  <meta name="robots" content="noindex, nofollow">
   <style>
-    :root { --primary: #ff5252; --bg: #f4f6f8; --card: #ffffff; --text: #2d3748; }
+    :root { --primary: #00ad9f; --bg: #f4f6f8; --card: #ffffff; --text: #2d3748; }
     @media (prefers-color-scheme: dark) { :root { --bg: #121212; --card: #1e1e1e; --text: #ffffff; } }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
@@ -67,16 +61,12 @@ const GENERATE_HTML = (challenge: string) => `
     <p>Please verify you are human.</p>
     <button id="verify-btn">I am human</button>
   </div>
-
   <script>
     const CHALLENGE = "${challenge}";
     const DIFFICULTY = ${DIFFICULTY};
-    
-    // Config your image paths here
     const IMG_CHECK = "/anubis-dist/img/pensive.webp";
     const IMG_SUCCESS = "/anubis-dist/img/happy.webp";
     const IMG_FAILED = "/anubis-dist/img/reject.webp";
-
     const btn = document.getElementById('verify-btn');
     const img = document.getElementById('mascot-img');
 
@@ -86,9 +76,7 @@ const GENERATE_HTML = (challenge: string) => `
     }
 
     async function mine() {
-      btn.disabled = true;
-      btn.innerText = 'Calculating...';
-      img.src = IMG_CHECK; 
+      btn.disabled = true; btn.innerText = 'Calculating...'; img.src = IMG_CHECK; 
       const prefix = "0".repeat(DIFFICULTY);
       let nonce = 0;
       while(true) {
@@ -103,10 +91,11 @@ const GENERATE_HTML = (challenge: string) => `
       btn.innerText = 'Verifying...';
       const fd = new FormData();
       fd.append('nonce', nonce); fd.append('response', response); fd.append('verify', 'true');
+      
       fetch(window.location.href, { method: 'POST', body: fd }).then(async res => {
         if (res.ok) {
           img.src = IMG_SUCCESS; btn.innerText = 'Success!';
-          setTimeout(() => window.location.reload(), 500);
+          setTimeout(() => window.location.replace(window.location.href), 500);
         } else {
           img.src = IMG_FAILED; btn.innerText = 'Retry'; btn.disabled = false;
         }
@@ -118,43 +107,60 @@ const GENERATE_HTML = (challenge: string) => `
 </html>
 `;
 
-export const onRequest: PagesFunction = async (context) => {
+export const onRequest: PagesFunction<Env> = async (context) => {
+  if (SECRET_KEY === "ALBIREO_DEFAULT_SECRET_KEY_CHANGE_ME") {
+    return new Response("SECURITY ERROR: Please change SECRET_KEY in _middleware.ts", { status: 500 });
+  }
+
   const { request, next } = context;
   const url = new URL(request.url);
   const ua = (request.headers.get("User-Agent") || "").toLowerCase();
 
-  // Pass static assets and bots
-  if (url.pathname.includes(".") || BOT_AGENTS.some(b => ua.includes(b))) return next();
+  // 1. Pass static assets
+  if (url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json)$/) || url.pathname.startsWith("/anubis-dist/")) {
+    return next();
+  }
   
-  // Pass if cookie exists
+  // 2. Pass SEO bots
+  if (BOT_AGENTS.some(b => ua.includes(b))) return next();
+
+  // 3. Check Cookie
   const cookie = request.headers.get("Cookie") || "";
   if (cookie.includes("anubis_solved=true")) return next();
 
-  // Verify Logic
+  // 4. Handle POST
   if (request.method === "POST") {
     try {
       const fd = await request.formData();
       if (!fd.has('verify')) return new Response("Bad Request", { status: 400 });
+
       const nonce = fd.get("nonce") as string;
       const response = fd.get("response") as string;
+      
       const cStr = cookie.split(';').find(c => c.trim().startsWith('anubis_challenge='));
       if (!cStr) return new Response("Expired", { status: 403 });
+
       const [challenge, sig] = decodeURIComponent(cStr.split('=')[1].trim()).split('.');
-      
-      if (!await verify(challenge, sig)) return new Response("Invalid Sig", { status: 403 });
+
+      if (!await verify(challenge, sig)) return new Response("Invalid Signature", { status: 403 });
       if (!await checkPoW(challenge, nonce, response, DIFFICULTY)) return new Response("POW Failed", { status: 403 });
 
       const headers = new Headers();
       headers.append("Set-Cookie", "anubis_solved=true; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400");
+      
       return new Response(JSON.stringify({ success: true }), { status: 200, headers });
-    } catch { return new Response("Error", { status: 500 }); }
+    } catch (e) {
+      return new Response("Server Error", { status: 500 });
+    }
   }
 
-  // Issue Challenge
+  // 5. Issue Challenge
   const rnd = crypto.randomUUID().replace(/-/g, '');
   const sig = await sign(rnd);
   const headers = new Headers();
   headers.set("Content-Type", "text/html");
+  headers.set("Cache-Control", "private, no-cache, no-store, must-revalidate");
   headers.set("Set-Cookie", `anubis_challenge=${encodeURIComponent(rnd + '.' + sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  
   return new Response(GENERATE_HTML(rnd), { headers });
 };
