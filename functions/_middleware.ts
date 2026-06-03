@@ -79,7 +79,7 @@ button:disabled { opacity: 0.7; }
 </head>
 <body>
 <div class="box">
-<img src="/anubis-dist/img/pensive.webp" class="mascot" id="mascot-img" alt="Guard"
+<img src="/albireo-dist/img/pensive.webp" class="mascot" id="mascot-img" alt="Guard"
 onerror="this.style.display='none'; document.getElementById('mascot-emoji').style.display='block';">
 <div class="mascot-emoji" id="mascot-emoji">😐</div>
 <h1>${STRINGS.heading}</h1>
@@ -90,9 +90,9 @@ onerror="this.style.display='none'; document.getElementById('mascot-emoji').styl
 const CHALLENGE = "${challenge}";
 const DIFFICULTY = ${DIFFICULTY};
 const ORIGINAL_PATH = "${originalPath}";
-const IMG_CHECK = "/anubis-dist/img/pensive.webp";
-const IMG_SUCCESS = "/anubis-dist/img/happy.webp";
-const IMG_FAILED = "/anubis-dist/img/reject.webp";
+const IMG_CHECK = "/albireo-dist/img/pensive.webp";
+const IMG_SUCCESS = "/albireo-dist/img/happy.webp";
+const IMG_FAILED = "/albireo-dist/img/reject.webp";
 const EMOJI_CHECK = "😐";
 const EMOJI_SUCCESS = "😊";
 const EMOJI_FAILED = "❌";
@@ -204,7 +204,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   const ua = (request.headers.get("User-Agent") || "").toLowerCase();
 
   // 1. Pass static assets（含 xml, rss, atom）
-  if (url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$/) || url.pathname.startsWith("/anubis-dist/")) {
+  if (url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$/) || url.pathname.startsWith("/albireo-dist/")) {
     return next();
   }
 
@@ -213,7 +213,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
   // 3. Check Cookie
   const cookie = request.headers.get("Cookie") || "";
-  if (cookie.includes("anubis_solved=true")) return next();
+  if (cookie.includes("albireo_solved=true")) return next();
 
   // 4. Handle POST
   if (request.method === "POST") {
@@ -225,7 +225,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       const response = fd.get("response") as string;
       const originalPath = safeRedirect(fd.get("original_path") as string || "/");
 
-      const cStr = cookie.split(';').find(c => c.trim().startsWith('anubis_challenge='));
+      const cStr = cookie.split(';').find(c => c.trim().startsWith('albireo_challenge='));
       if (!cStr) return new Response("Expired", { status: 403 });
 
       const [challenge, timestamp, sig] = decodeURIComponent(cStr.split('=')[1].trim()).split('.');
@@ -242,7 +242,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       if (!await checkPoW(challenge, nonce, response, DIFFICULTY)) return new Response("POW Failed", { status: 403 });
 
       const headers = new Headers();
-      headers.append("Set-Cookie", "anubis_solved=true; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400");
+      headers.append("Set-Cookie", "albireo_solved=true; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400");
       headers.set("Content-Type", "application/json");
 
       return new Response(JSON.stringify({ success: true, redirect: originalPath }), { status: 200, headers });
@@ -261,7 +261,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   const headers = new Headers();
   headers.set("Content-Type", "text/html");
   headers.set("Cache-Control", "private, no-cache, no-store, must-revalidate");
-  headers.set("Set-Cookie", `anubis_challenge=${encodeURIComponent(payload + '.' + sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  headers.set("Set-Cookie", `albireo_challenge=${encodeURIComponent(payload + '.' + sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
 
   return new Response(GENERATE_HTML(rnd, originalPath), { headers });
 };

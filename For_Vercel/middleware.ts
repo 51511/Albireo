@@ -77,7 +77,7 @@ button:disabled { opacity: 0.7; }
 </head>
 <body>
 <div class="box">
-<img src="/anubis-dist/img/pensive.webp" class="mascot" id="mascot-img" alt="Guard"
+<img src="/albireo-dist/img/pensive.webp" class="mascot" id="mascot-img" alt="Guard"
 onerror="this.style.display='none'; document.getElementById('mascot-emoji').style.display='block';">
 <div class="mascot-emoji" id="mascot-emoji">😐</div>
 <h1>${STRINGS.heading}</h1>
@@ -88,9 +88,9 @@ onerror="this.style.display='none'; document.getElementById('mascot-emoji').styl
 const CHALLENGE = "${challenge}";
 const DIFFICULTY = ${DIFFICULTY};
 const ORIGINAL_PATH = "${originalPath}";
-const IMG_CHECK = "/anubis-dist/img/pensive.webp";
-const IMG_SUCCESS = "/anubis-dist/img/happy.webp";
-const IMG_FAILED = "/anubis-dist/img/reject.webp";
+const IMG_CHECK = "/albireo-dist/img/pensive.webp";
+const IMG_SUCCESS = "/albireo-dist/img/happy.webp";
+const IMG_FAILED = "/albireo-dist/img/reject.webp";
 const EMOJI_CHECK = "😐";
 const EMOJI_SUCCESS = "😊";
 const EMOJI_FAILED = "❌";
@@ -204,7 +204,7 @@ export async function middleware(request: NextRequest) {
 
     // 2. Check Cookie
     const cookie = request.headers.get("Cookie") || "";
-    if (cookie.includes("anubis_solved=true")) return NextResponse.next();
+    if (cookie.includes("albireo_solved=true")) return NextResponse.next();
 
     // 3. Handle POST
     if (request.method === "POST") {
@@ -216,7 +216,7 @@ export async function middleware(request: NextRequest) {
             const response = fd.get("response") as string;
             const originalPath = safeRedirect(fd.get("original_path") as string || "/");
 
-            const cStr = cookie.split(';').find(c => c.trim().startsWith('anubis_challenge='));
+            const cStr = cookie.split(';').find(c => c.trim().startsWith('albireo_challenge='));
             if (!cStr) return new NextResponse("Expired", { status: 403 });
 
             const [challenge, timestamp, sig] = decodeURIComponent(cStr.split('=')[1].trim()).split('.');
@@ -232,7 +232,7 @@ export async function middleware(request: NextRequest) {
 
             const res = new NextResponse(JSON.stringify({ success: true, redirect: originalPath }), { status: 200 });
             res.headers.set("Content-Type", "application/json");
-            res.cookies.set("anubis_solved", "true", {
+            res.cookies.set("albireo_solved", "true", {
                 path: "/",
                 httpOnly: true,
                 secure: true,
@@ -256,7 +256,7 @@ export async function middleware(request: NextRequest) {
     const res = new NextResponse(GENERATE_HTML(rnd, originalPath), { status: 200 });
     res.headers.set("Content-Type", "text/html");
     res.headers.set("Cache-Control", "private, no-cache, no-store, must-revalidate");
-    res.cookies.set("anubis_challenge", encodeURIComponent(payload + '.' + sig), {
+    res.cookies.set("albireo_challenge", encodeURIComponent(payload + '.' + sig), {
         path: "/",
         httpOnly: true,
         secure: true,
@@ -269,6 +269,6 @@ export async function middleware(request: NextRequest) {
 export const config = {
     matcher: [
         // 攔截所有路徑，排除靜態資源
-        '/((?!_next/static|_next/image|favicon.ico|anubis-dist|.*\\.(?:png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$).*)',
+        '/((?!_next/static|_next/image|favicon.ico|albireo-dist|.*\\.(?:png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$).*)',
     ],
 };
