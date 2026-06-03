@@ -63,8 +63,9 @@ async function verifyHoneypotToken(token: string): Promise<boolean> {
   const parts = token.split(".");
   if (parts.length !== 2) return false;
   const [timestamp, safeSig] = parts;
-  // 還原 URL-safe base64
-  const sig = safeSig.replace(/-/g, '+').replace(/_/g, '/');
+  // 還原 URL-safe base64（補回 = padding）
+  let sig = safeSig.replace(/-/g, '+').replace(/_/g, '/');
+  while (sig.length % 4 !== 0) sig += '=';
   const issuedAt = parseInt(timestamp, 10);
   if (isNaN(issuedAt)) return false;
   if (Date.now() - issuedAt > HONEYPOT_TTL) return false;
