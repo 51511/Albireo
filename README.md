@@ -107,6 +107,8 @@ const STRINGS = {
 };
 ```
 
+# 等待翻譯
+目前在CF page新增Honeypot邏輯
 ---
 
 ## License
