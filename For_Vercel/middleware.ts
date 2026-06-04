@@ -199,8 +199,27 @@ export async function middleware(request: NextRequest) {
     const url = request.nextUrl;
     const ua = (request.headers.get("User-Agent") || "").toLowerCase();
 
-    // 1. Pass SEO bots
+    // 1. SEO bots 白名單 → 直接放行，跳過評分系統
     if (BOT_AGENTS.some(b => ua.includes(b))) return NextResponse.next();
+
+    // 1a. ★ 評分系統（白名單已放行，這裡只處理非白名單的請求）
+    let suspicionScore = 0;
+
+    // UA 含已知爬蟲特徵 → +10
+    const BOT_UA_PATTERNS = ["bot", "crawler", "spider", "scraper", "python-requests", "go-http-client", "curl", "wget", "libwww", "httpx"];
+    if (BOT_UA_PATTERNS.some(p => ua.includes(p))) suspicionScore += 10;
+
+    // 沒有 Accept header → +5（真實瀏覽器一定會帶）
+    const accept = request.headers.get("Accept") || "";
+    if (!accept) suspicionScore += 5;
+
+    // 沒有 User-Agent → +10（幾乎不可能是真人）
+    if (!ua) suspicionScore += 10;
+
+    // score >= 10 → DENY
+    if (suspicionScore >= 10) {
+        return new NextResponse("Forbidden", { status: 403 });
+    }
 
     // 2. Check Cookie
     const cookie = request.headers.get("Cookie") || "";
