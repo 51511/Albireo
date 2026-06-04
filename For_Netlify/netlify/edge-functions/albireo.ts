@@ -250,8 +250,27 @@ export default async (request: Request, context: Context) => {
     return context.next();
   }
 
-  // 2. SEO bots 放行
+  // 2. SEO bots 白名單 → 直接放行，跳過評分系統
   if (BOT_AGENTS.some(b => ua.includes(b))) return context.next();
+
+  // 2a. ★ 評分系統（白名單已放行，這裡只處理非白名單的請求）
+  let suspicionScore = 0;
+
+  // UA 含已知爬蟲特徵 → +10
+  const BOT_UA_PATTERNS = ["bot", "crawler", "spider", "scraper", "python-requests", "go-http-client", "curl", "wget", "libwww", "httpx"];
+  if (BOT_UA_PATTERNS.some(p => ua.includes(p))) suspicionScore += 10;
+
+  // 沒有 Accept header → +5（真實瀏覽器一定會帶）
+  const accept = request.headers.get("Accept") || "";
+  if (!accept) suspicionScore += 5;
+
+  // 沒有 User-Agent → +10（幾乎不可能是真人）
+  if (!ua) suspicionScore += 10;
+
+  // score >= 10 → DENY
+  if (suspicionScore >= 10) {
+    return new Response("Forbidden", { status: 403 });
+  }
 
   // 3. Honeypot 路徑偵測
   if (url.pathname.startsWith(HONEYPOT_PREFIX)) {
@@ -278,7 +297,7 @@ export default async (request: Request, context: Context) => {
     if (contentType.includes("text/html")) {
       const html = await response.text();
       const injected = html.replace("</body>",
-                                    `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
+        `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
       );
       return new Response(injected, {
         status: response.status,
@@ -336,7 +355,7 @@ export default async (request: Request, context: Context) => {
 
   const challengeHtml = GENERATE_HTML(rnd, originalPath);
   const injected = challengeHtml.replace("</body>",
-                                         `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
+    `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
   );
   return new Response(injected, { headers });
 };
