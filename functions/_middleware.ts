@@ -2,9 +2,10 @@ interface Env {
   ASSETS: Fetcher;
 }
 
+
 // === Configuration ===
-const DIFFICULTY = 3;
-const SECRET_KEY = "ALBIREO_DEFAULT_SECRET_KEY_CHANGE_ME"; // ★ 請務必修改這裡
+const DIFFICULTY = 3; // 可調整難度：數字越大越慢，建議 3~6
+const SECRET_KEY = "ALBIREO_SECRET_KEY_CHANGE_ME"; // ★ 請務必修改這裡
 const BOT_AGENTS = ["google", "bingbot", "yahoo", "duckduckbot"];
 const CHALLENGE_TTL = 5 * 60 * 1000;
 const HONEYPOT_TTL = 60 * 60 * 1000; // Honeypot 連結有效期 1 小時
@@ -16,11 +17,13 @@ const STRINGS = {
   heading: "Security Check",
   description: "Please verify you are human.",
   btn_start: "I am human",
+  btn_checking: "Checking...",
   btn_calculating: "Calculating...",
   btn_verifying: "Verifying...",
   btn_success: "Success!",
   btn_retry: "Retry",
   btn_error: "Error",
+  btn_bot_detected: "Access Denied",
 };
 
 // === Crypto Utils ===
@@ -122,11 +125,13 @@ const EMOJI_CHECK = "😐";
 const EMOJI_SUCCESS = "😊";
 const EMOJI_FAILED = "❌";
 const S = {
+  checking: ${JSON.stringify(STRINGS.btn_checking)},
   calculating: ${JSON.stringify(STRINGS.btn_calculating)},
   verifying: ${JSON.stringify(STRINGS.btn_verifying)},
   success: ${JSON.stringify(STRINGS.btn_success)},
   retry: ${JSON.stringify(STRINGS.btn_retry)},
   error: ${JSON.stringify(STRINGS.btn_error)},
+  bot_detected: ${JSON.stringify(STRINGS.btn_bot_detected)},
 };
 const btn = document.getElementById('verify-btn');
 const img = document.getElementById('mascot-img');
@@ -208,7 +213,28 @@ function submit(nonce, response) {
   });
 }
 
-btn.addEventListener('click', mine);
+// === BotD 行為偵測 ===
+async function checkHuman() {
+  btn.disabled = true;
+  btn.innerText = S.checking;
+  try {
+    const Botd = await import('https://openfpcdn.io/botd/v1');
+    const botd = await Botd.load();
+    const result = await botd.detect();
+    if (result.bot) {
+      setMascot(IMG_FAILED, EMOJI_FAILED);
+      btn.innerText = S.bot_detected;
+      btn.disabled = true;
+      return;
+    }
+    mine();
+  } catch (e) {
+    // BotD 載入失敗（例如被 adblocker 擋），直接放行跑 POW
+    mine();
+  }
+}
+
+btn.addEventListener('click', checkHuman);
 </script>
 </body>
 </html>
