@@ -1,24 +1,28 @@
 # Albireo 🛡️
-**Albireo** is a **serverless Proof-of-Work (PoW) protection** for static websites on **Cloudflare Pages**, based on [Anubis](https://github.com/TecharoHQ/anubis).  
+
+**Albireo** is a **serverless Proof-of-Work (PoW) protection** for static websites, based on [Anubis](https://github.com/TecharoHQ/anubis).  
 Albireo is designed to **deter the vast majority of automated crawlers**, including bots scraping your static content, without requiring a traditional server.  
 It is **not intended to defeat highly resourced or targeted scraping operations**.
 
-[DEMO（My blog)](https://www.leaftechblog.cloudns.biz/)
+[DEMO (My blog)](https://www.leaftechblog.cloudns.biz/)
+
 ---
 
 ## Why Albireo?
-Many static sites (GitHub Pages, Netlify, Vercel) **cannot run traditional anti-crawler systems** like Anubis, which require a server or reverse proxy.  
-(Now support Cloudflare Pages, Netlify, and Vercel)
+
+Many static sites (GitHub Pages, Netlify, Vercel) **cannot run traditional anti-crawler systems** like Anubis, which require a server or reverse proxy.
 
 Albireo allows you to:
-- ✅ Protect your static content with PoW challenges  
-- ✅ Fully serverless: runs on Cloudflare Pages Functions / Netlify Edge Functions  
-- ✅ Customizable front-end: mascots, messages, and UI  
-- ✅ Configurable difficulty: adjust CPU cost per request  
-- ✅ SEO-friendly: whitelist search engine bots  
-- ✅ Multi-threaded PoW: uses Web Workers to parallelize computation  
-- ✅ Challenge expiry: prevents stale challenges from being reused  
-- ✅ Safe redirect: prevents open redirect attacks after verification  
+- ✅ Protect your static content with PoW challenges
+- ✅ Fully serverless: runs on Cloudflare Pages Functions / Netlify Edge Functions / Vercel Middleware
+- ✅ Honeypot trap: silently marks and blocks crawlers that follow hidden links
+- ✅ Bot behavior detection: uses [BotD](https://github.com/fingerprintjs/BotD) to detect headless browsers before PoW
+- ✅ Customizable front-end: mascots, messages, and UI
+- ✅ Configurable difficulty: adjust CPU cost per request
+- ✅ SEO-friendly: whitelist search engine bots
+- ✅ Multi-threaded PoW: uses Web Workers to parallelize computation
+- ✅ Challenge expiry: prevents stale challenges from being reused
+- ✅ Safe redirect: prevents open redirect attacks after verification
 
 > Perfect for static documentation sites, portfolios, or open-source projects that want lightweight anti-scraping protection.
 
@@ -33,6 +37,8 @@ Albireo allows you to:
 | Works on Netlify | ✅ | ❌ | ❌ | ❌ |
 | Works on Vercel | ✅ | ❌ | ❌ | ❌ |
 | Proof-of-Work | ✅ | ✅ | ❌ | ✅ |
+| Honeypot trap | ✅ | ✅ | ❌ | ✅ |
+| Bot behavior detection | ✅ | ❌ | ⚠️ partial | ✅ |
 | Blocks JS-less bots | ✅ | ✅ | ⚠️ partial | ✅ |
 | Slows headless browsers | ✅ | ✅ | ❌ | ✅ |
 | Open source | ✅ | ✅ | ❌ | ❌ |
@@ -42,42 +48,60 @@ Albireo allows you to:
 
 ---
 
-## Setup (Cloudflare Pages)
-1. Copy the `functions` folder to your Cloudflare Pages project  
-2. Change `SECRET_KEY` in `_middleware.ts`  
-3. Add Images: Create `public/anubis-dist/img/` and add your own:  
-   - `pensive.webp`  
-   - `happy.webp`  
-   - `reject.webp`  
+## How it works
 
-> If you don't have images, the security check page will automatically fall back to emoji indicators (😐 / 😊 / ❌), so the protection works out of the box without any setup.
+When a visitor arrives, Albireo runs three layers of protection:
+
+```
+1. BotD (client-side)
+   Detects headless browsers (Puppeteer, Playwright, Selenium) before PoW even starts.
+   → Detected bot: blocked immediately, no PoW issued.
+   → Load failure (e.g. adblocker): falls through to PoW silently.
+
+2. Proof-of-Work (SHA-256)
+   The browser must find a nonce whose SHA-256 hash starts with N leading zeroes.
+   Parallelized across CPU cores via Web Workers.
+   → Passed: sets albireo_solved cookie (24hr).
+
+3. Honeypot
+   Every HTML page (including the challenge page) contains a hidden link that is
+   invisible to humans but followed by crawlers.
+   → Crawler visits the trap URL: sets albireo_bot cookie (24hr) and returns 403.
+   → Subsequent requests from marked crawlers: always 403, no PoW issued.
+```
+
+---
+
+## Setup (Cloudflare Pages)
+
+1. Copy the `functions` folder to your Cloudflare Pages project
+2. Change `SECRET_KEY` in `functions/_middleware.ts`
+3. Add images: create `public/albireo-dist/img/` and add:
+   - `pensive.webp`
+   - `happy.webp`
+   - `reject.webp`
+
+> If you don't have images, the security check page automatically falls back to emoji indicators (😐 / 😊 / ❌).
 
 ## Setup (Netlify)
-Use this if your site is hosted on Netlify.
 
-1. **Copy Files**: Go to the `For_Netlify` folder in this repo, and copy all its contents (`netlify/`, `netlify.toml`) to the root of your own project.  
-   - Your project root should now have a `netlify.toml` file and a `netlify` folder.  
-2. **Configure Secret**:  
-   - Open `netlify/edge-functions/albireo.ts`.  
-   - Find `SECRET_KEY` and change it to a random string (**Security Requirement**).  
-3. **Add Images**:  
-   - Create a folder `public/anubis-dist/img/` in your project (or ensure `public` exists).  
-   - Add your mascot images: `pensive.webp`, `happy.webp`, `reject.webp`.  
-   > If you don't have images, the security check page will automatically fall back to emoji indicators (😐 / 😊 / ❌), so the protection works out of the box without any setup.
-4. **Deploy**: Push to your repository. Netlify will automatically detect the Edge Functions via `netlify.toml`.
+1. **Copy Files**: Copy all contents of `For_Netlify/` (`netlify/`, `netlify.toml`) to the root of your project
+2. **Configure Secret**: Open `netlify/edge-functions/albireo.ts`, find `SECRET_KEY` and change it to a random string
+3. **Add Images**: Create `public/albireo-dist/img/` and add `pensive.webp`, `happy.webp`, `reject.webp`
+4. **Deploy**: Push to your repository. Netlify will detect the Edge Functions via `netlify.toml`
+
+> If you don't have images, the security check page automatically falls back to emoji indicators (😐 / 😊 / ❌).
 
 ## Setup (Vercel)
-Use this if your site is hosted on Vercel (Next.js or other frameworks).
-Go to "For Vercel" folder
-1. **Copy File**: Copy `middleware.ts` to the **root of your project**.
-2. **Configure Secret**:
-   - Open `middleware.ts`.
-   - Find `SECRET_KEY` and change it to a random string (**Security Requirement**).
-3. **Add Images**:
-   - Create a folder `public/anubis-dist/img/` in your project.
-   - Add your mascot images: `pensive.webp`, `happy.webp`, `reject.webp`.
-   > If you don't have images, the security check page will automatically fall back to emoji indicators (😐 / 😊 / ❌), so the protection works out of the box without any setup.
-4. **Deploy**: Push to your repository. Vercel will automatically pick up `middleware.ts`.
+
+1. **Copy File**: Copy `For_Vercel/middleware.ts` to the **root of your project**
+2. **Configure Secret**: Open `middleware.ts`, find `SECRET_KEY` and change it to a random string
+3. **Add Images**: Create `public/albireo-dist/img/` and add `pensive.webp`, `happy.webp`, `reject.webp`
+4. **Deploy**: Push to your repository. Vercel will automatically pick up `middleware.ts`
+
+> If you don't have images, the security check page automatically falls back to emoji indicators (😐 / 😊 / ❌).
+
+> ⚠️ **Vercel limitation**: Honeypot link injection is not supported on Vercel because Next.js Middleware cannot modify response bodies. The honeypot trap path detection still works — crawlers that somehow visit `/albireo-trap-*` will still be marked. For full honeypot support, use Cloudflare Pages or Netlify.
 
 ---
 
@@ -85,33 +109,37 @@ Go to "For Vercel" folder
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `DIFFICULTY` | PoW difficulty (higher = more CPU cost). Recommended: 3–6 | `5` |
+| `DIFFICULTY` | PoW difficulty (higher = more CPU cost). Recommended: 3–6 | `3–5` |
 | `SECRET_KEY` | HMAC signing key. **Must be changed before deployment** | — |
-| `BOT_AGENTS` | List of user agent substrings to whitelist (SEO bots) | Google, Bing, Yahoo, DuckDuckBot |
+| `BOT_AGENTS` | User agent substrings to whitelist (SEO bots) | Google, Bing, Yahoo, DuckDuckBot |
 | `CHALLENGE_TTL` | How long a challenge is valid (milliseconds) | `300000` (5 min) |
-| `STRINGS` | UI text for all labels and button states (for localization) | English |
+| `HONEYPOT_TTL` | How long a honeypot token is valid (milliseconds) | `3600000` (1 hr) |
+| `STRINGS` | UI text for all labels and button states (localization) | English |
 
 ### Localization example
-To display the security check in Traditional Chinese, change the `STRINGS` object in the config:
+
+To display the security check in Traditional Chinese:
+
 ```ts
 const STRINGS = {
   title: "安全驗證 | Albireo",
   heading: "安全驗證",
   description: "請確認您是真人。",
   btn_start: "我是人類",
+  btn_checking: "偵測中...",
   btn_calculating: "計算中...",
   btn_verifying: "驗證中...",
   btn_success: "成功！",
   btn_retry: "重試",
   btn_error: "錯誤",
+  btn_bot_detected: "存取遭拒",
 };
 ```
 
-# 等待翻譯
-目前在CF page新增Honeypot邏輯
 ---
 
 ## License
+
 MIT (Based on [Anubis](https://github.com/TecharoHQ/anubis) by TecharoHQ)
 
 [Why I'm using Albireo not Cloudflare?](https://www.leaftechblog.cloudns.biz/2026/01/26/Myblog/)
