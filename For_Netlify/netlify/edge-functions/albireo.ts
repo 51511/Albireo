@@ -4,7 +4,9 @@ import type { Context } from "@netlify/edge-functions";
 const DIFFICULTY = 4;
 const SECRET_KEY = "NETLIFY_ALBIREO_SECRET_KEY_CHANGE_ME"; // ★ 請務必修改這裡
 const BOT_AGENTS = ["google", "bingbot", "yahoo", "duckduckbot"];
-const CHALLENGE_TTL = 5 * 60 * 1000; // Challenge 過期時間（毫秒），預設 5 分鐘
+const CHALLENGE_TTL = 5 * 60 * 1000;
+const HONEYPOT_TTL = 60 * 60 * 1000;
+const HONEYPOT_PREFIX = "/albireo-trap-";
 
 // === UI Strings（可自訂語言）===
 const STRINGS = {
@@ -12,11 +14,13 @@ const STRINGS = {
   heading: "Security Check",
   description: "Please verify you are human.",
   btn_start: "I am human",
+  btn_checking: "Checking...",
   btn_calculating: "Calculating...",
   btn_verifying: "Verifying...",
   btn_success: "Success!",
   btn_retry: "Retry",
   btn_error: "Error",
+  btn_bot_detected: "Access Denied",
 };
 
 // === Crypto Utils ===
@@ -38,11 +42,30 @@ async function checkPoW(challenge: string, nonce: string, response: string, diff
   const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(msg));
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   const calculated = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
   if (calculated !== response) return false;
   const prefix = "0".repeat(difficulty);
   if (!calculated.startsWith(prefix)) return false;
   return true;
+}
+
+// === Honeypot Utils ===
+async function generateHoneypotToken(): Promise<string> {
+  const timestamp = Date.now().toString();
+  const sig = await sign("honeypot." + timestamp);
+  const safeSig = sig.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return timestamp + "." + safeSig;
+}
+
+async function verifyHoneypotToken(token: string): Promise<boolean> {
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [timestamp, safeSig] = parts;
+  let sig = safeSig.replace(/-/g, '+').replace(/_/g, '/');
+  while (sig.length % 4 !== 0) sig += '=';
+  const issuedAt = parseInt(timestamp, 10);
+  if (isNaN(issuedAt)) return false;
+  if (Date.now() - issuedAt > HONEYPOT_TTL) return false;
+  return await verify("honeypot." + timestamp, sig);
 }
 
 // === Safe Redirect Validator ===
@@ -95,11 +118,13 @@ const EMOJI_CHECK = "😐";
 const EMOJI_SUCCESS = "😊";
 const EMOJI_FAILED = "❌";
 const S = {
+  checking: ${JSON.stringify(STRINGS.btn_checking)},
   calculating: ${JSON.stringify(STRINGS.btn_calculating)},
   verifying: ${JSON.stringify(STRINGS.btn_verifying)},
   success: ${JSON.stringify(STRINGS.btn_success)},
   retry: ${JSON.stringify(STRINGS.btn_retry)},
   error: ${JSON.stringify(STRINGS.btn_error)},
+  bot_detected: ${JSON.stringify(STRINGS.btn_bot_detected)},
 };
 const btn = document.getElementById('verify-btn');
 const img = document.getElementById('mascot-img');
@@ -114,13 +139,11 @@ function setMascot(imgSrc, emojiChar) {
   }
 }
 
-// === Web Worker code (inline via Blob) ===
 const WORKER_CODE = \`
 async function sha256(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
-
 self.onmessage = async (e) => {
   const { challenge, difficulty, startNonce, step } = e.data;
   const prefix = "0".repeat(difficulty);
@@ -144,11 +167,9 @@ function createWorker() {
 function mine() {
   btn.disabled = true; btn.innerText = S.calculating;
   setMascot(IMG_CHECK, EMOJI_CHECK);
-
   const numWorkers = Math.max(1, (navigator.hardwareConcurrency || 4) - 1);
   const workers = [];
   let done = false;
-
   for (let i = 0; i < numWorkers; i++) {
     const worker = createWorker();
     workers.push(worker);
@@ -169,7 +190,6 @@ function submit(nonce, response) {
   fd.append('response', response);
   fd.append('verify', 'true');
   fd.append('original_path', ORIGINAL_PATH);
-
   fetch(window.location.href, { method: 'POST', body: fd }).then(async res => {
     if (res.ok) {
       const data = await res.json();
@@ -186,7 +206,27 @@ function submit(nonce, response) {
   });
 }
 
-btn.addEventListener('click', mine);
+// === BotD 行為偵測 ===
+async function checkHuman() {
+  btn.disabled = true;
+  btn.innerText = S.checking;
+  try {
+    const Botd = await import('https://openfpcdn.io/botd/v1');
+    const botd = await Botd.load();
+    const result = await botd.detect();
+    if (result.bot) {
+      setMascot(IMG_FAILED, EMOJI_FAILED);
+      btn.innerText = S.bot_detected;
+      btn.disabled = true;
+      return;
+    }
+    mine();
+  } catch (e) {
+    mine();
+  }
+}
+
+btn.addEventListener('click', checkHuman);
 </script>
 </body>
 </html>
@@ -200,20 +240,55 @@ export default async (request: Request, context: Context) => {
 
   const url = new URL(request.url);
   const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+  const cookie = request.headers.get("Cookie") || "";
 
-  // 1. Pass static assets（含 xml, rss, atom）
-  if (url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$/) || url.pathname.startsWith("/albireo-dist/")) {
+  // 1. 靜態資源直接放行
+  if (
+    url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$/) ||
+    url.pathname.startsWith("/albireo-dist/")
+  ) {
     return context.next();
   }
 
-  // 2. Pass SEO bots
+  // 2. SEO bots 放行
   if (BOT_AGENTS.some(b => ua.includes(b))) return context.next();
 
-  // 3. Check Cookie
-  const cookie = request.headers.get("Cookie") || "";
-  if (cookie.includes("albireo_solved=true")) return context.next();
+  // 3. Honeypot 路徑偵測
+  if (url.pathname.startsWith(HONEYPOT_PREFIX)) {
+    const token = url.pathname.slice(HONEYPOT_PREFIX.length);
+    if (await verifyHoneypotToken(token)) {
+      const headers = new Headers();
+      headers.append("Set-Cookie", "albireo_bot=true; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400");
+      return new Response("Not Found", { status: 403, headers });
+    }
+    return new Response("Not Found", { status: 404 });
+  }
 
-  // 4. Handle POST
+  // 4. Bot 黑名單檢查
+  if (cookie.includes("albireo_bot=true")) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  // 5. 已通過 POW 的放行（注入 honeypot 連結）
+  if (cookie.includes("albireo_solved=true")) {
+    const token = await generateHoneypotToken();
+    const trapPath = HONEYPOT_PREFIX + token;
+    const response = await context.next();
+    const contentType = response.headers.get("Content-Type") || "";
+    if (contentType.includes("text/html")) {
+      const html = await response.text();
+      const injected = html.replace("</body>",
+                                    `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
+      );
+      return new Response(injected, {
+        status: response.status,
+        headers: response.headers,
+      });
+    }
+    return response;
+  }
+
+  // 6. Handle POST（POW 驗證）
   if (request.method === "POST") {
     try {
       const fd = await request.formData();
@@ -227,11 +302,8 @@ export default async (request: Request, context: Context) => {
       if (!cStr) return new Response("Expired", { status: 403 });
 
       const [challenge, timestamp, sig] = decodeURIComponent(cStr.split('=')[1].trim()).split('.');
-
-      // 驗證簽名
       if (!await verify(challenge + '.' + timestamp, sig)) return new Response("Invalid Signature", { status: 403 });
 
-      // 驗證 challenge 是否過期
       const issuedAt = parseInt(timestamp, 10);
       if (isNaN(issuedAt) || Date.now() - issuedAt > CHALLENGE_TTL) {
         return new Response("Challenge Expired", { status: 403 });
@@ -242,24 +314,29 @@ export default async (request: Request, context: Context) => {
       const headers = new Headers();
       headers.append("Set-Cookie", "albireo_solved=true; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400");
       headers.set("Content-Type", "application/json");
-
       return new Response(JSON.stringify({ success: true, redirect: originalPath }), { status: 200, headers });
     } catch (e) {
       return new Response("Server Error", { status: 500 });
     }
   }
 
-  // 5. Issue Challenge
+  // 7. 發 Challenge（同時注入 honeypot 連結）
   const rnd = crypto.randomUUID().replace(/-/g, '');
   const timestamp = Date.now().toString();
   const payload = rnd + '.' + timestamp;
   const sig = await sign(payload);
   const originalPath = safeRedirect(url.pathname + url.search + url.hash);
+  const trapToken = await generateHoneypotToken();
+  const trapPath = HONEYPOT_PREFIX + trapToken;
 
   const headers = new Headers();
   headers.set("Content-Type", "text/html");
   headers.set("Cache-Control", "private, no-cache, no-store, must-revalidate");
   headers.set("Set-Cookie", `albireo_challenge=${encodeURIComponent(payload + '.' + sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
 
-  return new Response(GENERATE_HTML(rnd, originalPath), { headers });
+  const challengeHtml = GENERATE_HTML(rnd, originalPath);
+  const injected = challengeHtml.replace("</body>",
+                                         `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${trapPath}" rel="nofollow" tabindex="-1">.</a></div></body>`
+  );
+  return new Response(injected, { headers });
 };
