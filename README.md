@@ -25,34 +25,43 @@ Albireo allows you to:
 - ✅ Challenge expiry: prevents stale challenges from being reused
 - ✅ Safe redirect: prevents open redirect attacks after verification
 
+**Cloudflare Pages only (v2):**
+- ✅ Silent browser fingerprinting: 9-signal scoring detects headless browsers before any challenge is shown
+- ✅ Human fast-pass: real users pass silently with difficulty=1 PoW, no challenge page shown at all
+- ✅ HMAC-signed solved cookie: prevents forging the solved state with a plain cookie
+- ✅ Auto-execute on page load: no "I am human" button, everything runs automatically
+
 > Perfect for static documentation sites, portfolios, or open-source projects that want lightweight anti-scraping protection.
 
 ---
 
 ## How does Albireo compare?
 
-| | Albireo | Anubis | Cloudflare Free | Cloudflare Pro+ |
-|---|---|---|---|---|
-| Cost | **Free** | Free | Free | $20–200+/mo |
-| Requires server | ❌ | ✅ | ❌ | ❌ |
-| Works on Netlify | ✅ | ❌ | ❌ | ❌ |
-| Works on Vercel | ✅ | ❌ | ❌ | ❌ |
-| Proof-of-Work | ✅ | ✅ | ❌ | ✅ |
-| Suspicion scoring | ✅ | ✅ | ❌ | ✅ |
-| Honeypot trap | ✅ | ✅ | ❌ | ✅ |
-| Bot behavior detection | ✅ | ❌ | ⚠️ partial | ✅ |
-| Blocks JS-less bots | ✅ | ✅ | ⚠️ partial | ✅ |
-| Slows headless browsers | ✅ | ✅ | ❌ | ✅ |
-| Open source | ✅ | ✅ | ❌ | ❌ |
-| Dynamic difficulty | ❌ | ✅ | ❌ | ✅ |
+| | Albireo (CF v2) | Albireo | Anubis | Cloudflare Free | Cloudflare Pro+ |
+|---|---|---|---|---|---|
+| Cost | **Free** | **Free** | Free | Free | $20–200+/mo |
+| Requires server | ❌ | ❌ | ✅ | ❌ | ❌ |
+| Works on Netlify | ❌ (v2) | ✅ | ❌ | ❌ | ❌ |
+| Works on Vercel | ❌ (v2) | ✅ | ❌ | ❌ | ❌ |
+| Proof-of-Work | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Suspicion scoring | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Honeypot trap | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Bot behavior detection | ✅ | ✅ | ❌ | ⚠️ partial | ✅ |
+| Browser fingerprinting | ✅ | ❌ | ❌ | ❌ | ⚠️ partial |
+| Human fast-pass (no challenge) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| HMAC-signed cookies | ✅ | ❌ | ✅ | — | — |
+| Blocks JS-less bots | ✅ | ✅ | ✅ | ⚠️ partial | ✅ |
+| Slows headless browsers | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Open source | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Dynamic difficulty | ❌ | ❌ | ✅ | ❌ | ✅ |
 
 > Cloudflare's free Bot Fight Mode relies on User-Agent and IP heuristics, which are easy to bypass. Albireo's PoW forces every client — including headless browsers — to perform real computation, making large-scale scraping expensive even for bots that can run JavaScript.
 
 ---
 
-## How it works
+## How it works (Cloudflare Pages v2)
 
-When a visitor arrives, Albireo runs four layers of protection in order:
+When a visitor arrives, Albireo runs five layers of protection in order:
 
 ```
 0. SEO bot whitelist (BOT_AGENTS)
@@ -61,9 +70,9 @@ When a visitor arrives, Albireo runs four layers of protection in order:
 
 1. Suspicion scoring (server-side)
    Each request is scored before any challenge is issued:
-   · UA contains bot/crawler/spider/curl/wget/...  → +10
-   · No Accept header                              → +5
-   · No User-Agent at all                          → +10
+   · UA contains bot/crawler/spider/scrapy/curl/wget/...  → +10
+   · No Accept header                                     → +5
+   · No User-Agent at all                                 → +10
    score >= 10 → 403 immediately, no challenge issued.
    score <  10 → continue to next layer.
 
@@ -73,15 +82,42 @@ When a visitor arrives, Albireo runs four layers of protection in order:
    → Crawler visits trap URL: sets albireo_bot cookie (24hr) → 403.
    → Subsequent requests from marked crawlers: always 403.
 
-3. BotD (client-side)
+3. Silent browser fingerprinting (client-side, NEW in v2)
+   9 signals scored silently on page load, no user interaction needed:
+   · navigator.webdriver === true          → +100 (direct automation flag)
+   · WebGL SwiftShader / llvmpipe renderer → +60  (headless software renderer)
+   · CDP artifacts in window object        → +80  (ChromeDriver leftovers)
+   · navigator.plugins empty or fake       → +25/+40
+   · Chrome UA but no window.chrome        → +30
+   · navigator.languages missing           → +20
+   · Canvas renders blank                  → +35
+   · screen size zero or abnormal          → +20/+40
+   · Notification permission anomaly       → +15
+
+   score >= 60 → Access Denied immediately, no PoW issued.
+   score < 10  → Human fast-pass: silent difficulty=1 PoW, user sees nothing. ✨
+   score 10–59 → Continue to BotD + full PoW.
+
+4. BotD (client-side)
    Detects headless browsers (Puppeteer, Playwright, Selenium) before PoW starts.
    → Detected bot: blocked immediately, no PoW issued.
    → Load failure (e.g. adblocker): falls through to PoW silently.
 
-4. Proof-of-Work (SHA-256)
+5. Proof-of-Work (SHA-256)
    The browser must find a nonce whose SHA-256 hash starts with N leading zeroes.
    Parallelized across CPU cores via Web Workers.
-   → Passed: sets albireo_solved cookie (24hr).
+   → Passed: sets HMAC-signed albireo_solved cookie (24hr).
+   → Cookie is verified server-side on every subsequent request.
+```
+
+### Human fast-pass flow (v2)
+
+Real browsers with no suspicious signals skip the challenge entirely:
+
+```
+Page loads → fingerprint score = 0 → silent difficulty=1 PoW (~100ms)
+→ HMAC-signed cookie issued → redirect to destination
+User sees: nothing. Total time: ~300ms.
 ```
 
 ---
@@ -106,6 +142,8 @@ When a visitor arrives, Albireo runs four layers of protection in order:
 
 > If you don't have images, the security check page automatically falls back to emoji indicators (😐 / 😊 / ❌).
 
+> ⚠️ **Netlify/Vercel note**: The fingerprinting, fast-pass, and HMAC cookie features are **Cloudflare Pages only (v2)**. Netlify and Vercel versions remain at v1 behaviour.
+
 ## Setup (Vercel)
 
 1. **Copy File**: Copy `For_Vercel/middleware.ts` to the **root of your project**
@@ -126,7 +164,7 @@ When a visitor arrives, Albireo runs four layers of protection in order:
 | `DIFFICULTY` | PoW difficulty (higher = more CPU cost). Recommended: 3–6 | `3–5` |
 | `SECRET_KEY` | HMAC signing key. **Must be changed before deployment** | — |
 | `BOT_AGENTS` | User agent substrings to whitelist (SEO bots, always bypass scoring) | Google, Bing, Yahoo, DuckDuckBot |
-| `BOT_UA_PATTERNS` | UA substrings that add +10 suspicion score | bot, crawler, curl, wget, ... |
+| `BOT_UA_PATTERNS` | UA substrings that add +10 suspicion score | bot, crawler, scrapy, curl, wget, ... |
 | `CHALLENGE_TTL` | How long a challenge is valid (milliseconds) | `300000` (5 min) |
 | `HONEYPOT_TTL` | How long a honeypot token is valid (milliseconds) | `3600000` (1 hr) |
 | `STRINGS` | UI text for all labels and button states (localization) | English |
