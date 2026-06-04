@@ -15,11 +15,12 @@ Many static sites (GitHub Pages, Netlify, Vercel) **cannot run traditional anti-
 Albireo allows you to:
 - ✅ Protect your static content with PoW challenges
 - ✅ Fully serverless: runs on Cloudflare Pages Functions / Netlify Edge Functions / Vercel Middleware
+- ✅ Suspicion scoring: blocks known crawler UA, missing headers before PoW is even issued
 - ✅ Honeypot trap: silently marks and blocks crawlers that follow hidden links
 - ✅ Bot behavior detection: uses [BotD](https://github.com/fingerprintjs/BotD) to detect headless browsers before PoW
 - ✅ Customizable front-end: mascots, messages, and UI
 - ✅ Configurable difficulty: adjust CPU cost per request
-- ✅ SEO-friendly: whitelist search engine bots
+- ✅ SEO-friendly: whitelist search engine bots (always bypasses scoring)
 - ✅ Multi-threaded PoW: uses Web Workers to parallelize computation
 - ✅ Challenge expiry: prevents stale challenges from being reused
 - ✅ Safe redirect: prevents open redirect attacks after verification
@@ -37,6 +38,7 @@ Albireo allows you to:
 | Works on Netlify | ✅ | ❌ | ❌ | ❌ |
 | Works on Vercel | ✅ | ❌ | ❌ | ❌ |
 | Proof-of-Work | ✅ | ✅ | ❌ | ✅ |
+| Suspicion scoring | ✅ | ✅ | ❌ | ✅ |
 | Honeypot trap | ✅ | ✅ | ❌ | ✅ |
 | Bot behavior detection | ✅ | ❌ | ⚠️ partial | ✅ |
 | Blocks JS-less bots | ✅ | ✅ | ⚠️ partial | ✅ |
@@ -50,24 +52,36 @@ Albireo allows you to:
 
 ## How it works
 
-When a visitor arrives, Albireo runs three layers of protection:
+When a visitor arrives, Albireo runs four layers of protection in order:
 
 ```
-1. BotD (client-side)
-   Detects headless browsers (Puppeteer, Playwright, Selenium) before PoW even starts.
+0. SEO bot whitelist (BOT_AGENTS)
+   Google, Bing, Yahoo, DuckDuckBot and any custom entries → pass through immediately.
+   Whitelisted bots skip ALL checks below.
+
+1. Suspicion scoring (server-side)
+   Each request is scored before any challenge is issued:
+   · UA contains bot/crawler/spider/curl/wget/...  → +10
+   · No Accept header                              → +5
+   · No User-Agent at all                          → +10
+   score >= 10 → 403 immediately, no challenge issued.
+   score <  10 → continue to next layer.
+
+2. Honeypot
+   Every HTML page (including the challenge page) contains a hidden link
+   invisible to humans but followed by crawlers.
+   → Crawler visits trap URL: sets albireo_bot cookie (24hr) → 403.
+   → Subsequent requests from marked crawlers: always 403.
+
+3. BotD (client-side)
+   Detects headless browsers (Puppeteer, Playwright, Selenium) before PoW starts.
    → Detected bot: blocked immediately, no PoW issued.
    → Load failure (e.g. adblocker): falls through to PoW silently.
 
-2. Proof-of-Work (SHA-256)
+4. Proof-of-Work (SHA-256)
    The browser must find a nonce whose SHA-256 hash starts with N leading zeroes.
    Parallelized across CPU cores via Web Workers.
    → Passed: sets albireo_solved cookie (24hr).
-
-3. Honeypot
-   Every HTML page (including the challenge page) contains a hidden link that is
-   invisible to humans but followed by crawlers.
-   → Crawler visits the trap URL: sets albireo_bot cookie (24hr) and returns 403.
-   → Subsequent requests from marked crawlers: always 403, no PoW issued.
 ```
 
 ---
@@ -111,7 +125,8 @@ When a visitor arrives, Albireo runs three layers of protection:
 |--------|-------------|---------|
 | `DIFFICULTY` | PoW difficulty (higher = more CPU cost). Recommended: 3–6 | `3–5` |
 | `SECRET_KEY` | HMAC signing key. **Must be changed before deployment** | — |
-| `BOT_AGENTS` | User agent substrings to whitelist (SEO bots) | Google, Bing, Yahoo, DuckDuckBot |
+| `BOT_AGENTS` | User agent substrings to whitelist (SEO bots, always bypass scoring) | Google, Bing, Yahoo, DuckDuckBot |
+| `BOT_UA_PATTERNS` | UA substrings that add +10 suspicion score | bot, crawler, curl, wget, ... |
 | `CHALLENGE_TTL` | How long a challenge is valid (milliseconds) | `300000` (5 min) |
 | `HONEYPOT_TTL` | How long a honeypot token is valid (milliseconds) | `3600000` (1 hr) |
 | `STRINGS` | UI text for all labels and button states (localization) | English |
