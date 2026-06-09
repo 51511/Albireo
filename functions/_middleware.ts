@@ -138,7 +138,7 @@ h1{margin-bottom:10px}
   <p id="dc">${STRINGS.description}</p>
   <div id="st"></div>
   <div id="pb"><div id="pf"></div></div>
-  <div id="dm">${STRINGS.btn_bot_detected}</div>
+  <div id="dm">${STRINGS.btn_bot_detected}<p id="dm-hint" style="margin-top:8px;font-size:.8rem;display:none"></p></div>
 </div>
 <script>
 const CHALLENGE="${challenge}",DIFFICULTY=${powDifficulty},ORIG="${originalPath}",FP_NONCE="${fpNonce}";
@@ -150,18 +150,31 @@ const sm=(s,e)=>{if(ue())me.innerText=e;else mi.src=s;};
 const ss=m=>{st.innerText=m;};
 const sp=()=>{pb.style.display='block';};
 const hp=()=>{pb.style.display='none';};
-const sd=()=>{dm.style.display='block';dc.style.display='none';};
+const sd=(hint)=>{dm.style.display='block';dc.style.display='none';const dh=document.getElementById('dm-hint');if(hint&&dh){dh.innerText=hint;dh.style.display='block';}};
 
 async function detectBrowser() {
   const ua=navigator.userAgent,uaLow=ua.toLowerCase();
   let isBrave=false,fakeBrave=false;
   try {
-    isBrave=!!(await navigator.brave?.isBrave?.());
+    // isBrave() 有時會拋出例外，加 timeout 防止卡住
+    const braveCheck = new Promise(resolve => {
+      try {
+        const r = navigator.brave?.isBrave?.();
+        if(r && typeof r.then === 'function') {
+          // 設 500ms timeout，超時視為非 Brave
+          const timer = setTimeout(() => resolve(false), 500);
+          r.then(v => { clearTimeout(timer); resolve(!!v); }).catch(() => resolve(false));
+        } else {
+          resolve(!!r);
+        }
+      } catch(e) { resolve(false); }
+    });
+    isBrave = !!(await braveCheck);
     if(isBrave){
       if(typeof window.chrome==='undefined'){fakeBrave=true;isBrave=false;}
       if(typeof navigator.brave?.version!=='undefined'){fakeBrave=true;isBrave=false;}
     }
-  } catch(e){}
+  } catch(e){ isBrave=false; }
   const uaIsSafari=/^((?!chrome|android|crios|fxios).)*safari/i.test(ua);
   const hasSafariObj=typeof window.safari!=='undefined';
   let isSafari=false,fakeSafari=false;
@@ -289,9 +302,9 @@ function chkTiming(t0){
   if(ms<50)return 20;if(ms>30000)return 10;return 0;
 }
 
-let lastScore=0;
+let lastScore=0,t0Start=0;
 async function run(){
-  const t0=Date.now();
+  const t0=Date.now();t0Start=t0;
   const{isBrave,isSafari,isFirefoxRFP,fakeBrave,fakeSafari}=await detectBrowser();
   const[audioScore,fontScore]=await Promise.all([
     chkAudio(isBrave||isSafari||isFirefoxRFP),
@@ -310,13 +323,13 @@ async function run(){
   if(fakeBrave){score+=50;sigs.push('fake_brave=50');}
   lastScore=score; // 存給 submit() 用
   if(fakeSafari){score+=35;sigs.push('fake_safari=35');}
-  if(score>=60){sm('/albireo-dist/img/reject.webp','❌');sd();return;}
+  if(score>=60){sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');return;}
   if(score>=10){
     try{
       const Botd=await import('https://openfpcdn.io/botd/v1');
       const botd=await Botd.load();
       const result=await botd.detect();
-      if(result.bot){sm('/albireo-dist/img/reject.webp','❌');sd();return;}
+      if(result.bot){sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');return;}
     }catch(e){}
   }
   mine();
@@ -344,15 +357,19 @@ function submit(nonce,response){
   fd.append('nonce',String(nonce));fd.append('response',response);
   fd.append('verify','true');fd.append('original_path',ORIG);
   fd.append('fp_score',String(lastScore));fd.append('fp_nonce',FP_NONCE);
+  fd.append('elapsed',String(Date.now()-t0Start));
   fetch(window.location.href,{method:'POST',body:fd})
     .then(async r=>{
       if(r.ok){const d=await r.json();hp();sm('/albireo-dist/img/happy.webp','😊');ss(${JSON.stringify(STRINGS.btn_success)});setTimeout(()=>{window.location.href=d.redirect;},300);}
-      else{hp();sm('/albireo-dist/img/reject.webp','❌');ss(${JSON.stringify(STRINGS.btn_error)});}
+      else{
+        hp();sm('/albireo-dist/img/reject.webp','❌');
+        sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');
+      }
     })
-    .catch(()=>{hp();sm('/albireo-dist/img/reject.webp','❌');ss(${JSON.stringify(STRINGS.btn_error)});});
+    .catch(()=>{hp();sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');});
 }
 
-run();
+run().catch(e=>{ hp(); sm('/albireo-dist/img/reject.webp','❌'); sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。'); });
 </script>
 </body></html>
 `;
@@ -473,6 +490,13 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       // FIX: 驗 fp_score（爬蟲如實回報高分就擋）
       const fpScore=parseInt(fd.get("fp_score") as string||"0",10);
       if(fpScore>=60)return new Response("Bot Detected",{status:403});
+      // FIX: elapsedTime 驗證
+      // 真實瀏覽器跑指紋偵測至少需要 300ms
+      // 太快代表沒跑 JS 直接 POST
+      const elapsed=parseInt(fd.get("elapsed") as string||"0",10);
+      if(isNaN(elapsed)||elapsed<10)return new Response("Too Fast",{status:403});
+      // 太慢也可疑（超過 5 分鐘，challenge 幾乎過期）
+      if(elapsed>CHALLENGE_TTL)return new Response("Too Slow",{status:403});
       const sts=Date.now().toString();
       const rs=await sign("solved."+sts);
       const ss2=rs.replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
