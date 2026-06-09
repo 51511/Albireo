@@ -61,61 +61,52 @@ function safeRedirect(path: string): string {
 
 // ============================================================
 // Tor Exit Node 偵測
-// 使用 Tor Project 官方 DNSEL（DNS-based Exit List）
-// 透過 Cloudflare DoH 查詢，不需要原生 DNS API
-//
-// 查詢格式：{reversed_ip}.{port}.{server_ip}.ip-port.exitlist.torproject.org
-// 回傳 127.0.0.2 → 是 Tor exit node
-// 回傳 NXDOMAIN → 不是
-//
-// 注意：我們用簡化版，只查 IP（不帶 port 和 server IP）
-// 格式：{reversed_ip}.dnsel.torproject.org
-// 這個格式查「這個 IP 是否為任何 Tor exit node」
+// 使用 Tor Project 官方 DNSEL + in-memory cache
 // ============================================================
+
+// 簡單 in-memory cache，避免同一 IP 重複查詢
+// Cloudflare Workers 每個 isolate 共用，有效降低 DoH 查詢頻率
+const torCache = new Map<string, {result: boolean, ts: number}>();
+const TOR_CACHE_TTL = 10 * 60 * 1000; // 10 分鐘
+
 async function isTorExitNode(ip: string): Promise<boolean> {
   try {
-    // 只支援 IPv4（Tor exit nodes 幾乎都是 IPv4）
-    // IPv6 的 Tor exit node 非常少，暫不處理
     if (!ip || ip.includes(':')) return false;
-
-    // 把 IP 倒過來：1.2.3.4 → 4.3.2.1
     const parts = ip.split('.');
     if (parts.length !== 4) return false;
-    const reversed = parts.reverse().join('.');
 
-    // 查 dnsel.torproject.org（簡化版，查任何 exit）
-    const query = `${reversed}.dnsel.torproject.org`;
-
-    // 用 Cloudflare DoH 做 DNS 查詢
-    const res = await fetch(
-      `https://cloudflare-dns.com/dns-query?name=${query}&type=A`,
-      {
-        headers: { 'Accept': 'application/dns-json' },
-        // 設定短 timeout，避免拖慢請求
-        signal: AbortSignal.timeout(2000),
-      }
-    );
-
-    if (!res.ok) return false;
-
-    const data: any = await res.json();
-
-    // 如果有 Answer 且包含 127.0.0.2 → 是 Tor exit node
-    if (data.Answer && Array.isArray(data.Answer)) {
-      return data.Answer.some((record: any) =>
-        record.type === 1 && record.data === '127.0.0.2'
-      );
+    // 查快取
+    const cached = torCache.get(ip);
+    if (cached && Date.now() - cached.ts < TOR_CACHE_TTL) {
+      return cached.result;
     }
 
-    return false;
+    const reversed = parts.slice().reverse().join('.');
+    const query = `${reversed}.dnsel.torproject.org`;
+
+    // timeout 1秒，失敗放行
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${query}&type=A`,
+      { headers: { 'Accept': 'application/dns-json' }, signal: controller.signal }
+    );
+    clearTimeout(timer);
+
+    if (!res.ok) { torCache.set(ip, {result: false, ts: Date.now()}); return false; }
+
+    const data: any = await res.json();
+    const isTor = !!(data.Answer?.some((r: any) => r.type === 1 && r.data === '127.0.0.2'));
+    torCache.set(ip, {result: isTor, ts: Date.now()});
+    return isTor;
   } catch(e) {
-    // 查詢失敗（timeout / 網路問題）→ 不擋，避免誤傷
-    return false;
+    return false; // 查詢失敗 → 放行，不誤傷
   }
 }
 
 // === HTML ===
-const GENERATE_HTML = (challenge: string, originalPath: string, powDifficulty: number) => `
+const GENERATE_HTML = (challenge: string, originalPath: string, powDifficulty: number, fpNonce: string) => `
 <!DOCTYPE html><html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -150,7 +141,7 @@ h1{margin-bottom:10px}
   <div id="dm">${STRINGS.btn_bot_detected}</div>
 </div>
 <script>
-const CHALLENGE="${challenge}",DIFFICULTY=${powDifficulty},ORIG="${originalPath}";
+const CHALLENGE="${challenge}",DIFFICULTY=${powDifficulty},ORIG="${originalPath}",FP_NONCE="${fpNonce}";
 const mi=document.getElementById('mi'),me=document.getElementById('me');
 const st=document.getElementById('st'),pb=document.getElementById('pb');
 const dm=document.getElementById('dm'),dc=document.getElementById('dc');
@@ -165,14 +156,14 @@ async function detectBrowser() {
   const ua=navigator.userAgent,uaLow=ua.toLowerCase();
   let isBrave=false,fakeBrave=false;
   try {
-    isBrave=!!(await (navigator as any).brave?.isBrave?.());
+    isBrave=!!(await navigator.brave?.isBrave?.());
     if(isBrave){
       if(typeof window.chrome==='undefined'){fakeBrave=true;isBrave=false;}
-      if(typeof (navigator as any).brave?.version!=='undefined'){fakeBrave=true;isBrave=false;}
+      if(typeof navigator.brave?.version!=='undefined'){fakeBrave=true;isBrave=false;}
     }
   } catch(e){}
   const uaIsSafari=/^((?!chrome|android|crios|fxios).)*safari/i.test(ua);
-  const hasSafariObj=typeof (window as any).safari!=='undefined';
+  const hasSafariObj=typeof window.safari!=='undefined';
   let isSafari=false,fakeSafari=false;
   if(uaIsSafari){
     const isIOS=/iphone|ipad|ipod/i.test(ua);
@@ -203,10 +194,10 @@ function chkWebGL(){
   }catch(e){return 10;}
 }
 
-async function chkAudio(exempt: boolean){
+async function chkAudio(exempt){
   if(exempt)return 0;
   try{
-    const AC=(window as any).OfflineAudioContext||(window as any).webkitOfflineAudioContext;
+    const AC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
     if(!AC)return 20;
     const ctx=new AC(1,44100,44100);
     const osc=ctx.createOscillator(),comp=ctx.createDynamicsCompressor();
@@ -223,7 +214,7 @@ async function chkAudio(exempt: boolean){
   }catch(e){return 15;}
 }
 
-function chkFonts(exempt: boolean){
+function chkFonts(exempt){
   if(exempt)return 0;
   try{
     const c=document.createElement('canvas'),ctx=c.getContext('2d');if(!ctx)return 10;
@@ -232,7 +223,7 @@ function chkFonts(exempt: boolean){
       'Trebuchet MS','Arial Black','Impact','Calibri','Cambria',
       'Tahoma','Geneva','Optima','Futura','Century Gothic'];
     const bases=['monospace','sans-serif','serif'],str='mmmmmmmmmmlli',sz='72px ';
-    const bw: Record<string,number>={};
+    const bw={};
     for(const b of bases){ctx.font=sz+b;bw[b]=ctx.measureText(str).width;}
     let found=0;
     for(const f of fonts)for(const b of bases){
@@ -243,7 +234,7 @@ function chkFonts(exempt: boolean){
   }catch(e){return 10;}
 }
 
-function chkCanvas(exempt: boolean){
+function chkCanvas(exempt){
   if(exempt)return 0;
   try{
     const render=()=>{
@@ -267,12 +258,12 @@ function chkCDP(){
     const keys=['cdc_adoQpoasnfa76pfcZLmcfl_Array','cdc_adoQpoasnfa76pfcZLmcfl_Promise',
       '__webdriver_script_fn','__driver_evaluate','__webdriver_evaluate',
       '__selenium_evaluate','__fxdriver_evaluate','__driver_unwrapped','__webdriver_unwrapped'];
-    if(keys.some(k=>(window as any)[k]!==undefined))return 80;
+    if(keys.some(k=>window[k]!==undefined))return 80;
     return 0;
   }catch(e){return 0;}
 }
 
-function chkConsistency(isSafari: boolean,isFirefoxRFP: boolean){
+function chkConsistency(isSafari,isFirefoxRFP){
   let s=0;
   try{
     const ua=navigator.userAgent.toLowerCase();
@@ -283,7 +274,7 @@ function chkConsistency(isSafari: boolean,isFirefoxRFP: boolean){
     const cores=navigator.hardwareConcurrency;
     if(cores&&(cores<1||cores>128||!Number.isInteger(cores)))s+=25;
     if(!isFirefoxRFP){
-      const mem=(navigator as any).deviceMemory;
+      const mem=navigator.deviceMemory;
       if(mem!==undefined&&![0.25,0.5,1,2,4,8].includes(mem))s+=20;
       if(screen.width===0||screen.height===0)s+=40;
       else if(screen.width<200||screen.height<200)s+=20;
@@ -293,11 +284,12 @@ function chkConsistency(isSafari: boolean,isFirefoxRFP: boolean){
   return s;
 }
 
-function chkTiming(t0: number){
+function chkTiming(t0){
   const ms=Date.now()-t0;
   if(ms<50)return 20;if(ms>30000)return 10;return 0;
 }
 
+let lastScore=0;
 async function run(){
   const t0=Date.now();
   const{isBrave,isSafari,isFirefoxRFP,fakeBrave,fakeSafari}=await detectBrowser();
@@ -305,8 +297,8 @@ async function run(){
     chkAudio(isBrave||isSafari||isFirefoxRFP),
     Promise.resolve(chkFonts(isFirefoxRFP)),
   ]);
-  let score=0;const sigs: string[]=[];
-  const add=(s: number,l: string)=>{if(s>0){score+=s;sigs.push(l+'='+s);}};
+  let score=0;const sigs=[];
+  const add=(s,l)=>{if(s>0){score+=s;sigs.push(l+'='+s);}};
   add(chkWebDriver(),'webdriver');
   add(chkWebGL(),'webgl');
   add(audioScore,'audio');
@@ -316,6 +308,7 @@ async function run(){
   add(chkConsistency(isSafari,isFirefoxRFP),'consistency');
   add(chkTiming(t0),'timing');
   if(fakeBrave){score+=50;sigs.push('fake_brave=50');}
+  lastScore=score; // 存給 submit() 用
   if(fakeSafari){score+=35;sigs.push('fake_safari=35');}
   if(score>=60){sm('/albireo-dist/img/reject.webp','❌');sd();return;}
   if(score>=10){
@@ -337,7 +330,7 @@ self.onmessage=async e=>{const{challenge,difficulty,startNonce,step}=e.data;cons
 function mine(){
   ss(${JSON.stringify(STRINGS.btn_calculating)});sp();
   const n=Math.max(1,(navigator.hardwareConcurrency||4)-1);
-  const ws: Worker[]=[];let done=false;
+  const ws=[];let done=false;
   for(let i=0;i<n;i++){
     const w=new Worker(URL.createObjectURL(new Blob([WC],{type:'application/javascript'})));
     ws.push(w);w.postMessage({challenge:CHALLENGE,difficulty:DIFFICULTY,startNonce:i,step:n});
@@ -345,11 +338,12 @@ function mine(){
   }
 }
 
-function submit(nonce: number,response: string){
+function submit(nonce,response){
   ss(${JSON.stringify(STRINGS.btn_verifying)});
   const fd=new FormData();
   fd.append('nonce',String(nonce));fd.append('response',response);
   fd.append('verify','true');fd.append('original_path',ORIG);
+  fd.append('fp_score',String(lastScore));fd.append('fp_nonce',FP_NONCE);
   fetch(window.location.href,{method:'POST',body:fd})
     .then(async r=>{
       if(r.ok){const d=await r.json();hp();sm('/albireo-dist/img/happy.webp','😊');ss(${JSON.stringify(STRINGS.btn_success)});setTimeout(()=>{window.location.href=d.redirect;},300);}
@@ -464,14 +458,21 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       if(!cStr)return new Response("Expired",{status:403});
       const cv=decodeURIComponent(cStr.split('=')[1].trim());
       const parts=cv.split('.');
-      if(parts.length!==4)return new Response("Invalid Challenge",{status:403});
-      const[ch,ts,diffStr,sig]=parts;
-      if(!await verify(ch+'.'+ts+'.'+diffStr,sig))return new Response("Invalid Signature",{status:403});
+      if(parts.length!==5)return new Response("Invalid Challenge",{status:403}); // FIX: 5 段
+      const[ch,ts,diffStr,cookieFpNonce,sig]=parts;
+      // FIX: 簽名涵蓋 fp_nonce
+      if(!await verify(ch+'.'+ts+'.'+diffStr+'.'+cookieFpNonce,sig))return new Response("Invalid Signature",{status:403});
       const issued=parseInt(ts,10);
       if(isNaN(issued)||Date.now()-issued>CHALLENGE_TTL)return new Response("Challenge Expired",{status:403});
       const diff=parseInt(diffStr,10);
       if(isNaN(diff)||diff<1)return new Response("Invalid Difficulty",{status:403});
       if(!await checkPoW(ch,nonce,resp,diff))return new Response("POW Failed",{status:403});
+      // FIX: 驗 fp_nonce（確認 JS 有跑、不是直接 POST）
+      const clientFpNonce=fd.get("fp_nonce") as string||"";
+      if(clientFpNonce!==cookieFpNonce)return new Response("Fingerprint Token Mismatch",{status:403});
+      // FIX: 驗 fp_score（爬蟲如實回報高分就擋）
+      const fpScore=parseInt(fd.get("fp_score") as string||"0",10);
+      if(fpScore>=60)return new Response("Bot Detected",{status:403});
       const sts=Date.now().toString();
       const rs=await sign("solved."+sts);
       const ss2=rs.replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
@@ -487,7 +488,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   const rnd=crypto.randomUUID().replace(/-/g,'');
   const ts=Date.now().toString();
   const ds=serverDiff.toString();
-  const payload=rnd+'.'+ts+'.'+ds;
+  const fpNonce=crypto.randomUUID().replace(/-/g,''); // FIX: session-bound fp_nonce
+  const payload=rnd+'.'+ts+'.'+ds+'.'+fpNonce;       // FIX: 5 段，含 fp_nonce
   const sig=await sign(payload);
   const orig=safeRedirect(url.pathname+url.search+url.hash);
   const trap=await generateHoneypotToken();
@@ -495,7 +497,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   h.set("Content-Type","text/html");
   h.set("Cache-Control","private,no-cache,no-store,must-revalidate");
   h.set("Set-Cookie",`albireo_challenge=${encodeURIComponent(payload+'.'+sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
-  const html=GENERATE_HTML(rnd,orig,serverDiff);
+  const html=GENERATE_HTML(rnd,orig,serverDiff,fpNonce); // FIX: 傳 fpNonce 給 HTML
   const injected=html.replace("</body>",
     `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${HONEYPOT_PREFIX+trap}" rel="nofollow" tabindex="-1">.</a></div></body>`
   );
