@@ -186,32 +186,33 @@ async function detectBrowser() {
   const isFF=uaLow.includes('firefox');
   const isFirefoxRFP=isFF&&screen.width===1280&&screen.height===900;
   // Tor 已在 server-side 擋掉，client-side 不再需要偵測
-  return{isBrave,isSafari,isFirefoxRFP,fakeBrave,fakeSafari};
+  return{isBrave,isSafari,isFirefoxRFP,isFF,fakeBrave,fakeSafari};
 }
 
 function chkWebDriver(){return navigator.webdriver===true?100:0;}
 
-function chkWebGL(){
+function chkWebGL(isFF){
   try{
     const c=document.createElement('canvas');
     const gl=c.getContext('webgl')||c.getContext('experimental-webgl');
-    if(!gl)return 30;
+    if(!gl)return isFF?0:30; // Firefox 沒 WebGL 不扣分
     const ext=gl.getExtension('WEBGL_debug_renderer_info');
-    if(!ext)return 15;
+    if(!ext)return isFF?0:15;
     const r=(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)||'').toLowerCase();
     const v=(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)||'').toLowerCase();
     const SOFT=['swiftshader','llvmpipe','mesa offscreen','software rasterizer','brian paul','softpipe','angle (google)'];
-    if(SOFT.some(s=>r.includes(s)))return 60;
-    if(!v)return 20;
+    // Firefox 在某些 Android/Linux 裝置上合法使用 llvmpipe，不應扣分
+    if(SOFT.some(s=>r.includes(s)))return isFF?0:60;
+    if(!v)return isFF?0:20;
     return 0;
-  }catch(e){return 10;}
+  }catch(e){return isFF?0:10;}
 }
 
-async function chkAudio(exempt){
+async function chkAudio(exempt,isFF){
   if(exempt)return 0;
   try{
     const AC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
-    if(!AC)return 20;
+    if(!AC)return isFF?0:20; // Firefox 沒有 AC 不扣分
     const ctx=new AC(1,44100,44100);
     const osc=ctx.createOscillator(),comp=ctx.createDynamicsCompressor();
     osc.type='triangle';osc.frequency.setValueAtTime(10000,ctx.currentTime);
@@ -222,9 +223,10 @@ async function chkAudio(exempt){
     const buf=await ctx.startRendering();
     const data=buf.getChannelData(0);
     let sum=0;for(let i=4500;i<5000;i++)sum+=Math.abs(data[i]);
-    if(sum===0||isNaN(sum))return 50;
+    // Firefox 的 ETP/RFP 可能讓 sum=0，不應視為 bot
+    if(sum===0||isNaN(sum))return isFF?0:50;
     return 0;
-  }catch(e){return 15;}
+  }catch(e){return isFF?0:15;} // Firefox 拋出例外也不扣分
 }
 
 function chkFonts(exempt){
@@ -299,23 +301,24 @@ function chkConsistency(isSafari,isFirefoxRFP){
 
 function chkTiming(t0){
   const ms=Date.now()-t0;
-  if(ms<50)return 20;if(ms>30000)return 10;return 0;
+  if(ms>30000)return 10; // 只擋太慢
+  return 0;
 }
 
 let lastScore=0,t0Start=0;
 async function run(){
   const t0=Date.now();t0Start=t0;
-  const{isBrave,isSafari,isFirefoxRFP,fakeBrave,fakeSafari}=await detectBrowser();
+  const{isBrave,isSafari,isFirefoxRFP,isFF,fakeBrave,fakeSafari}=await detectBrowser();
   const[audioScore,fontScore]=await Promise.all([
-    chkAudio(isBrave||isSafari||isFirefoxRFP),
+    chkAudio(isBrave||isSafari||isFirefoxRFP,isFF),
     Promise.resolve(chkFonts(isFirefoxRFP)),
   ]);
   let score=0;const sigs=[];
   const add=(s,l)=>{if(s>0){score+=s;sigs.push(l+'='+s);}};
   add(chkWebDriver(),'webdriver');
-  add(chkWebGL(),'webgl');
+  add(chkWebGL(isFF),'webgl');
   add(audioScore,'audio');
-  add(fontScore,'fonts');
+  if(!isFF)add(fontScore,'fonts'); // Firefox 字型少是正常的，不扣分
   add(chkCanvas(isBrave||isSafari),'canvas');
   add(chkCDP(),'cdp');
   add(chkConsistency(isSafari,isFirefoxRFP),'consistency');
