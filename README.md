@@ -4,7 +4,7 @@
 Albireo is designed to **deter the vast majority of automated crawlers**, including bots scraping your static content, without requiring a traditional server.  
 It is **not intended to defeat highly resourced or targeted scraping operations**.
 
-[DEMO (My blog)](https://www.leaftechblog.cloudns.biz/)
+
 
 ---
 
