@@ -44,12 +44,23 @@ async function checkPoW(ch: string, nonce: string, resp: string, diff: number, b
   return h === resp && h.startsWith("0".repeat(diff));
 }
 
-// FIX: 把 signals 物件做穩定序列化，固定 key 順序，跟 Node 版 signalsDigestInput 對齊
-// 前端與後端都要用同一套 key 順序與同一套序列化方式，否則雜湊永遠對不上
+// FIX2: 全部換成「原始特徵值」，不是前端算好的子分數。
+// 判斷「這個特徵該扣幾分、要不要因為 Brave/Safari/Firefox RFP 而豁免」
+// 這件事整套搬到伺服器端做，前端只負責蒐集事實、不做任何評分判斷。
+// 跟 Node 版 signalsDigestInput 對齊：固定 key 順序，前後端序列化方式必須一致。
 const SIGNAL_KEYS = [
-  'webdriver', 'has_cdp_keys', 'webgl_score', 'audio_score', 'fonts_score',
-  'canvas_score', 'consistency_score', 'is_brave', 'is_safari', 'is_firefox_rfp',
-  'fake_brave', 'fake_safari'
+  'webdriver', 'has_cdp_keys',
+  'webgl_supported', 'webgl_has_debug_ext', 'webgl_renderer', 'webgl_vendor',
+  'audio_supported', 'audio_sum_is_zero_or_nan', 'audio_threw',
+  'fonts_found_count',
+  'canvas_supported', 'canvas_unstable', 'canvas_data_len_low',
+  'has_window_chrome', 'ua_is_chrome_like',
+  'plugins_is_native_pluginarray',
+  'language', 'languages', 'hardware_concurrency', 'device_memory',
+  'screen_width', 'screen_height', 'outer_width', 'outer_height',
+  'is_brave', 'is_safari', 'is_firefox', 'is_firefox_rfp',
+  'fake_brave', 'fake_safari',
+  'timing_ms'
 ] as const;
 
 function signalsDigestInput(sig: Record<string, unknown>): string {
@@ -123,9 +134,14 @@ async function isTorExitNode(ip: string): Promise<boolean> {
 }
 
 // ============================================================
-// FIX: 伺服器端重新評分 —— 不信任客戶端算好的 fp_score，
-// 只信任客戶端回報的「原始訊號」，分數邏輯整套搬到伺服器算
+// FIX2: 伺服器端重新評分 —— 完整搬過來的判斷邏輯，跟前端 chk* 系列
+// 的豁免規則一一對應。前端只回報「事實」(renderer 字串、screen 寬高等)，
+// 要不要扣分、扣多少、豁免與否，全部由這裡重新判斷。
+// 等同於 Node 版 scoreFromSignals 的嚴謹度。
 // ============================================================
+const SOFT_RENDERERS = ['swiftshader','llvmpipe','mesa offscreen','software rasterizer','brian paul','softpipe','angle (google)'];
+const VALID_DEVICE_MEMORY = [0.25, 0.5, 1, 2, 4, 8];
+
 function scoreFromSignals(sig: Record<string, any>) {
   let score = 0;
   const reasons: string[] = [];
@@ -133,23 +149,82 @@ function scoreFromSignals(sig: Record<string, any>) {
     if (cond) { score += pts; reasons.push(label + '=' + pts); }
   };
 
+  const isFF = sig.is_firefox === true;
+  const isFirefoxRFP = sig.is_firefox_rfp === true;
+  const isBrave = sig.is_brave === true;
+  const isSafari = sig.is_safari === true;
+  const audioExempt = isBrave || isSafari || isFirefoxRFP;
+  const canvasExempt = isBrave || isSafari;
+  const fontsExempt = isFirefoxRFP;
+
+  // --- webdriver / CDP：跟瀏覽器種類無關，一律照實扣分 ---
   add(sig.webdriver === true, 100, 'webdriver');
   add(sig.has_cdp_keys === true, 80, 'cdp');
 
-  // 前端已經把 webgl/audio/fonts/canvas/consistency 的「子分數」算好回報，
-  // 伺服器直接加總這些子分數，而不是信任前端算好的總分 fp_score。
-  // 這仍然比 Node 版弱一點（子分數本身還是前端自己判斷），
-  // 但至少把「哪個檢查項目該不該豁免」(isBrave/isSafari/isFirefoxRFP) 的邏輯
-  // 跟「最終要不要擋」的邏輯分開驗證，比單一裸分數更難靠亂填數字繞過
-  const clamp = (n: unknown, max: number) => {
-    const v = typeof n === 'number' && Number.isFinite(n) ? n : 0;
-    return Math.max(0, Math.min(v, max));
-  };
-  add(true, clamp(sig.webgl_score, 60), 'webgl');
-  add(true, clamp(sig.audio_score, 50), 'audio');
-  add(true, clamp(sig.fonts_score, 40), 'fonts');
-  add(true, clamp(sig.canvas_score, 35), 'canvas');
-  add(true, clamp(sig.consistency_score, 125), 'consistency');
+  // --- WebGL：對齊前端 chkWebGL 的 isFF 豁免規則 ---
+  if (!isFF) {
+    if (sig.webgl_supported !== true) {
+      add(true, 30, 'webgl_missing');
+    } else if (sig.webgl_has_debug_ext !== true) {
+      add(true, 15, 'webgl_no_debug_ext');
+    } else {
+      const r = typeof sig.webgl_renderer === 'string' ? sig.webgl_renderer.toLowerCase() : '';
+      const v = typeof sig.webgl_vendor === 'string' ? sig.webgl_vendor : '';
+      if (SOFT_RENDERERS.some(s => r.includes(s))) add(true, 60, 'webgl_software');
+      else if (!v) add(true, 20, 'webgl_no_vendor');
+    }
+  }
+
+  // --- Audio：對齊前端 chkAudio 的豁免規則（Brave/Safari/FirefoxRFP 豁免）---
+  if (!audioExempt) {
+    if (sig.audio_supported !== true) add(true, isFF ? 0 : 20, 'audio_missing');
+    else if (sig.audio_threw === true) add(true, isFF ? 0 : 15, 'audio_threw');
+    else if (sig.audio_sum_is_zero_or_nan === true) add(true, isFF ? 0 : 50, 'audio_zero');
+  }
+
+  // --- Fonts：Firefox RFP 豁免（字型清單本來就少），非 Firefox 才扣分 ---
+  if (!fontsExempt && !isFF) {
+    const found = typeof sig.fonts_found_count === 'number' ? sig.fonts_found_count : 0;
+    if (found <= 2) add(true, 40, 'fonts_few');
+    else if (found <= 4) add(true, 15, 'fonts_some');
+  }
+
+  // --- Canvas：對齊前端 chkCanvas 的豁免規則（Brave/Safari 豁免）---
+  if (!canvasExempt) {
+    if (sig.canvas_supported !== true) add(true, 10, 'canvas_unsupported');
+    else if (sig.canvas_unstable === true) add(true, 30, 'canvas_unstable');
+    else if (sig.canvas_data_len_low === true) add(true, 35, 'canvas_short');
+  }
+
+  // --- Consistency：對齊前端 chkConsistency 逐項規則 ---
+  const uaIsChromeLike = sig.ua_is_chrome_like === true;
+  if (!isSafari && uaIsChromeLike && sig.has_window_chrome !== true) add(true, 30, 'fake_chrome');
+  if (sig.plugins_is_native_pluginarray === false) add(true, 40, 'plugins_fake');
+  if (sig.language && Array.isArray(sig.languages) && !sig.languages.includes(sig.language)) {
+    add(true, 15, 'lang_mismatch');
+  }
+  const cores = sig.hardware_concurrency;
+  if (typeof cores === 'number' && (cores < 1 || cores > 128 || !Number.isInteger(cores))) {
+    add(true, 25, 'cores_anomaly');
+  }
+  if (!isFirefoxRFP) {
+    const mem = sig.device_memory;
+    if (mem !== undefined && mem !== null && !VALID_DEVICE_MEMORY.includes(mem)) {
+      add(true, 20, 'memory_anomaly');
+    }
+    const sw = sig.screen_width, sh = sig.screen_height;
+    if (sw === 0 || sh === 0) add(true, 40, 'screen_zero');
+    else if (typeof sw === 'number' && typeof sh === 'number' && (sw < 200 || sh < 200)) {
+      add(true, 20, 'screen_small');
+    }
+    if (sig.outer_width === 0 && sig.outer_height === 0) add(true, 20, 'outer_zero');
+  }
+
+  // --- Timing：跟前端 chkTiming 一致，只擋太慢 ---
+  if (typeof sig.timing_ms === 'number' && sig.timing_ms > 30000) add(true, 10, 'too_slow_client');
+
+  // --- fakeBrave / fakeSafari：前端已判斷好的矛盾訊號，直接信任布林值即可，
+  // 因為這類「矛盾」本身很難靠回報假資料製造（要同時偽造多個相關聯的 API）---
   add(sig.fake_brave === true, 50, 'fake_brave');
   add(sig.fake_safari === true, 35, 'fake_safari');
 
@@ -239,27 +314,29 @@ async function detectBrowser() {
 
 function chkWebDriver(){return navigator.webdriver===true?100:0;}
 
-function chkWebGL(isFF){
+// FIX2: chk* 系列全部改成只回報「原始事實」，不算分、不套用任何豁免邏輯。
+// 誰該豁免、扣幾分，全部交給伺服器端 scoreFromSignals 判斷。
+// 這樣一來，前端就算被竄改，最多只能謊報「事實」，但謊報事實一樣要付出
+// 重新挖 PoW 的代價（因為事實會被雜湊進 sigDigest），而不是像舊版可以
+// 直接謊報「結論」(分數) 繞過整套判斷邏輯。
+
+function readWebGL(){
   try{
     const c=document.createElement('canvas');
     const gl=c.getContext('webgl')||c.getContext('experimental-webgl');
-    if(!gl)return isFF?0:30;
+    if(!gl)return{webgl_supported:false,webgl_has_debug_ext:false,webgl_renderer:null,webgl_vendor:null};
     const ext=gl.getExtension('WEBGL_debug_renderer_info');
-    if(!ext)return isFF?0:15;
+    if(!ext)return{webgl_supported:true,webgl_has_debug_ext:false,webgl_renderer:null,webgl_vendor:null};
     const r=(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)||'').toLowerCase();
-    const v=(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)||'').toLowerCase();
-    const SOFT=['swiftshader','llvmpipe','mesa offscreen','software rasterizer','brian paul','softpipe','angle (google)'];
-    if(SOFT.some(s=>r.includes(s)))return isFF?0:60;
-    if(!v)return isFF?0:20;
-    return 0;
-  }catch(e){return isFF?0:10;}
+    const v=(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)||'');
+    return{webgl_supported:true,webgl_has_debug_ext:true,webgl_renderer:r,webgl_vendor:v||null};
+  }catch(e){return{webgl_supported:false,webgl_has_debug_ext:false,webgl_renderer:null,webgl_vendor:null,webgl_threw:true};}
 }
 
-async function chkAudio(exempt,isFF){
-  if(exempt)return 0;
+async function readAudio(){
   try{
     const AC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
-    if(!AC)return isFF?0:20;
+    if(!AC)return{audio_supported:false,audio_sum_is_zero_or_nan:false,audio_threw:false};
     const ctx=new AC(1,44100,44100);
     const osc=ctx.createOscillator(),comp=ctx.createDynamicsCompressor();
     osc.type='triangle';osc.frequency.setValueAtTime(10000,ctx.currentTime);
@@ -270,15 +347,13 @@ async function chkAudio(exempt,isFF){
     const buf=await ctx.startRendering();
     const data=buf.getChannelData(0);
     let sum=0;for(let i=4500;i<5000;i++)sum+=Math.abs(data[i]);
-    if(sum===0||isNaN(sum))return isFF?0:50;
-    return 0;
-  }catch(e){return isFF?0:15;}
+    return{audio_supported:true,audio_sum_is_zero_or_nan:(sum===0||isNaN(sum)),audio_threw:false};
+  }catch(e){return{audio_supported:true,audio_sum_is_zero_or_nan:false,audio_threw:true};}
 }
 
-function chkFonts(exempt){
-  if(exempt)return 0;
+function readFonts(){
   try{
-    const c=document.createElement('canvas'),ctx=c.getContext('2d');if(!ctx)return 10;
+    const c=document.createElement('canvas'),ctx=c.getContext('2d');if(!ctx)return{fonts_found_count:-1};
     const fonts=['Arial','Helvetica','Times New Roman','Courier New','Verdana',
       'Georgia','Palatino','Garamond','Bookman','Comic Sans MS',
       'Trebuchet MS','Arial Black','Impact','Calibri','Cambria',
@@ -291,12 +366,11 @@ function chkFonts(exempt){
       ctx.font=sz+f+','+b;
       if(ctx.measureText(str).width!==bw[b]){found++;break;}
     }
-    if(found<=2)return 40;if(found<=4)return 15;return 0;
-  }catch(e){return 10;}
+    return{fonts_found_count:found};
+  }catch(e){return{fonts_found_count:-1};}
 }
 
-function chkCanvas(exempt){
-  if(exempt)return 0;
+function readCanvas(){
   try{
     const render=()=>{
       const c=document.createElement('canvas');c.width=200;c.height=50;
@@ -310,51 +384,58 @@ function chkCanvas(exempt){
       return c.toDataURL();
     };
     const r1=render(),r2=render();
-    if(r1!==r2)return 30;if(!r1||r1.length<100)return 35;return 0;
-  }catch(e){return 10;}
+    return{canvas_supported:true,canvas_unstable:(r1!==r2),canvas_data_len_low:(!r1||r1.length<100)};
+  }catch(e){return{canvas_supported:false,canvas_unstable:false,canvas_data_len_low:false};}
 }
 
-function chkCDP(){
+function readCDP(){
   try{
     const keys=['cdc_adoQpoasnfa76pfcZLmcfl_Array','cdc_adoQpoasnfa76pfcZLmcfl_Promise',
       '__webdriver_script_fn','__driver_evaluate','__webdriver_evaluate',
       '__selenium_evaluate','__fxdriver_evaluate','__driver_unwrapped','__webdriver_unwrapped'];
-    if(keys.some(k=>window[k]!==undefined))return true;
-    return false;
+    return keys.some(k=>window[k]!==undefined);
   }catch(e){return false;}
 }
 
-function chkConsistency(isSafari,isFirefoxRFP){
-  let s=0;
+function readConsistency(){
   try{
     const ua=navigator.userAgent.toLowerCase();
-    const isChrome=ua.includes('chrome')&&!ua.includes('edg')&&!ua.includes('opr')&&!ua.includes('samsung');
-    if(!isSafari&&isChrome&&typeof window.chrome==='undefined')s+=30;
-    if(navigator.plugins&&!(navigator.plugins instanceof PluginArray))s+=40;
-    if(navigator.language&&navigator.languages&&!navigator.languages.includes(navigator.language))s+=15;
-    const cores=navigator.hardwareConcurrency;
-    if(cores&&(cores<1||cores>128||!Number.isInteger(cores)))s+=25;
-    if(!isFirefoxRFP){
-      const mem=navigator.deviceMemory;
-      if(mem!==undefined&&![0.25,0.5,1,2,4,8].includes(mem))s+=20;
-      if(screen.width===0||screen.height===0)s+=40;
-      else if(screen.width<200||screen.height<200)s+=20;
-      if(window.outerWidth===0&&window.outerHeight===0)s+=20;
-    }
-  }catch(e){}
-  return s;
+    const uaIsChromeLike=ua.includes('chrome')&&!ua.includes('edg')&&!ua.includes('opr')&&!ua.includes('samsung');
+    return{
+      has_window_chrome: typeof window.chrome!=='undefined',
+      ua_is_chrome_like: uaIsChromeLike,
+      plugins_is_native_pluginarray: navigator.plugins ? (navigator.plugins instanceof PluginArray) : true,
+      language: navigator.language||null,
+      languages: navigator.languages ? Array.from(navigator.languages) : [],
+      hardware_concurrency: navigator.hardwareConcurrency||0,
+      device_memory: navigator.deviceMemory!==undefined ? navigator.deviceMemory : null,
+      screen_width: screen.width,
+      screen_height: screen.height,
+      outer_width: window.outerWidth,
+      outer_height: window.outerHeight
+    };
+  }catch(e){
+    return{has_window_chrome:false,ua_is_chrome_like:false,plugins_is_native_pluginarray:true,
+      language:null,languages:[],hardware_concurrency:0,device_memory:null,
+      screen_width:0,screen_height:0,outer_width:0,outer_height:0};
+  }
 }
 
-function chkTiming(t0){
-  const ms=Date.now()-t0;
-  if(ms>30000)return 10;
-  return 0;
-}
-
-// FIX: 固定 key 順序的序列化，必須跟伺服器端 signalsDigestInput 完全一致
-const SIGNAL_KEYS=['webdriver','has_cdp_keys','webgl_score','audio_score','fonts_score',
-  'canvas_score','consistency_score','is_brave','is_safari','is_firefox_rfp',
-  'fake_brave','fake_safari'];
+// FIX2: SIGNAL_KEYS 跟伺服器端完全對齊（原始事實，不是分數）
+const SIGNAL_KEYS=[
+  'webdriver','has_cdp_keys',
+  'webgl_supported','webgl_has_debug_ext','webgl_renderer','webgl_vendor',
+  'audio_supported','audio_sum_is_zero_or_nan','audio_threw',
+  'fonts_found_count',
+  'canvas_supported','canvas_unstable','canvas_data_len_low',
+  'has_window_chrome','ua_is_chrome_like',
+  'plugins_is_native_pluginarray',
+  'language','languages','hardware_concurrency','device_memory',
+  'screen_width','screen_height','outer_width','outer_height',
+  'is_brave','is_safari','is_firefox','is_firefox_rfp',
+  'fake_brave','fake_safari',
+  'timing_ms'
+];
 function clientSignalsDigestInput(sig){
   return SIGNAL_KEYS.map(k=>k+':'+JSON.stringify(sig[k]===undefined?null:sig[k])).join('|');
 }
@@ -364,47 +445,105 @@ async function hashSignalsClient(sig){
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
 }
 
+// 本地「預估」分數，純粹拿來決定要不要先秀拒絕畫面、要不要多跑一次 BotD。
+// 這份計分邏輯刻意跟伺服器端保持同步，但即使跟伺服器算出來的不完全一致也沒關係 ——
+// 因為最終准不准，一律是伺服器拿同一包原始 signals 重算之後才決定，
+// 這裡算錯或被竄改，最多只是前端畫面誤判，不影響後端真正的判斷。
+function localEstimateScore(sig){
+  let s=0;
+  if(sig.webdriver)s+=100;
+  if(sig.has_cdp_keys)s+=80;
+  const isFF=sig.is_firefox;
+  if(!isFF){
+    if(!sig.webgl_supported)s+=30;
+    else if(!sig.webgl_has_debug_ext)s+=15;
+    else{
+      const SOFT=['swiftshader','llvmpipe','mesa offscreen','software rasterizer','brian paul','softpipe','angle (google)'];
+      const r=sig.webgl_renderer||'';
+      if(SOFT.some(x=>r.includes(x)))s+=60;else if(!sig.webgl_vendor)s+=20;
+    }
+  }
+  const audioExempt=sig.is_brave||sig.is_safari||sig.is_firefox_rfp;
+  if(!audioExempt){
+    if(!sig.audio_supported)s+=isFF?0:20;
+    else if(sig.audio_threw)s+=isFF?0:15;
+    else if(sig.audio_sum_is_zero_or_nan)s+=isFF?0:50;
+  }
+  if(!sig.is_firefox_rfp&&!isFF){
+    if(sig.fonts_found_count<=2)s+=40;else if(sig.fonts_found_count<=4)s+=15;
+  }
+  const canvasExempt=sig.is_brave||sig.is_safari;
+  if(!canvasExempt){
+    if(!sig.canvas_supported)s+=10;else if(sig.canvas_unstable)s+=30;else if(sig.canvas_data_len_low)s+=35;
+  }
+  if(!sig.is_safari&&sig.ua_is_chrome_like&&!sig.has_window_chrome)s+=30;
+  if(sig.plugins_is_native_pluginarray===false)s+=40;
+  if(sig.language&&sig.languages&&!sig.languages.includes(sig.language))s+=15;
+  const cores=sig.hardware_concurrency;
+  if(cores&&(cores<1||cores>128||!Number.isInteger(cores)))s+=25;
+  if(!sig.is_firefox_rfp){
+    const mem=sig.device_memory;
+    if(mem!==undefined&&mem!==null&&![0.25,0.5,1,2,4,8].includes(mem))s+=20;
+    if(sig.screen_width===0||sig.screen_height===0)s+=40;
+    else if(sig.screen_width<200||sig.screen_height<200)s+=20;
+    if(sig.outer_width===0&&sig.outer_height===0)s+=20;
+  }
+  if(sig.fake_brave)s+=50;
+  if(sig.fake_safari)s+=35;
+  return s;
+}
+
 let lastSignals={},sigDigest='',t0Start=0;
 async function run(){
   const t0=Date.now();t0Start=t0;
   const{isBrave,isSafari,isFirefoxRFP,isFF,fakeBrave,fakeSafari}=await detectBrowser();
-  const[audioScore,fontScore]=await Promise.all([
-    chkAudio(isBrave||isSafari||isFirefoxRFP,isFF),
-    Promise.resolve(chkFonts(isFirefoxRFP)),
-  ]);
-
-  const webglScore=chkWebGL(isFF);
-  const canvasScore=chkCanvas(isBrave||isSafari);
-  const consistencyScore=chkConsistency(isSafari,isFirefoxRFP);
-  const hasCdp=chkCDP();
+  const[audio,fonts]=await Promise.all([readAudio(),Promise.resolve(readFonts())]);
+  const webgl=readWebGL();
+  const canvas=readCanvas();
+  const consistency=readConsistency();
+  const hasCdp=readCDP();
   const webdriverFlag=navigator.webdriver===true;
-  const fontsScoreFinal=isFF?0:fontScore;
+  const timingMs=Date.now()-t0;
 
-  // FIX: 送「原始訊號」給伺服器，而不是只送一個 fp_score 總分
+  // FIX2: 送「原始事實」給伺服器，不送任何算好的分數或結論
   lastSignals={
     webdriver: webdriverFlag,
     has_cdp_keys: hasCdp,
-    webgl_score: webglScore,
-    audio_score: audioScore,
-    fonts_score: fontsScoreFinal,
-    canvas_score: canvasScore,
-    consistency_score: consistencyScore,
+    webgl_supported: webgl.webgl_supported,
+    webgl_has_debug_ext: webgl.webgl_has_debug_ext,
+    webgl_renderer: webgl.webgl_renderer,
+    webgl_vendor: webgl.webgl_vendor,
+    audio_supported: audio.audio_supported,
+    audio_sum_is_zero_or_nan: audio.audio_sum_is_zero_or_nan,
+    audio_threw: audio.audio_threw,
+    fonts_found_count: fonts.fonts_found_count,
+    canvas_supported: canvas.canvas_supported,
+    canvas_unstable: canvas.canvas_unstable,
+    canvas_data_len_low: canvas.canvas_data_len_low,
+    has_window_chrome: consistency.has_window_chrome,
+    ua_is_chrome_like: consistency.ua_is_chrome_like,
+    plugins_is_native_pluginarray: consistency.plugins_is_native_pluginarray,
+    language: consistency.language,
+    languages: consistency.languages,
+    hardware_concurrency: consistency.hardware_concurrency,
+    device_memory: consistency.device_memory,
+    screen_width: consistency.screen_width,
+    screen_height: consistency.screen_height,
+    outer_width: consistency.outer_width,
+    outer_height: consistency.outer_height,
     is_brave: isBrave,
     is_safari: isSafari,
+    is_firefox: isFF,
     is_firefox_rfp: isFirefoxRFP,
     fake_brave: fakeBrave,
-    fake_safari: fakeSafari
+    fake_safari: fakeSafari,
+    timing_ms: timingMs
   };
   sigDigest = await hashSignalsClient(lastSignals);
 
-  // 本地也算一次分數，純粹用來決定要不要先跳出 BotD 二次檢查或直接拒絕顯示，
-  // 真正擋不擋人,由伺服器重新計分後決定,這裡的判斷不是最終防線
-  let localScore=0;
-  if(webdriverFlag)localScore+=100;
-  if(hasCdp)localScore+=80;
-  localScore+=webglScore+audioScore+fontsScoreFinal+canvasScore+consistencyScore;
-  if(fakeBrave)localScore+=50;
-  if(fakeSafari)localScore+=35;
+  // 本地預估分數只決定「要不要先在畫面上秀拒絕、要不要多跑一次 BotD 二次確認」，
+  // 不是最終防線 —— 真正准不准，由伺服器對同一包 lastSignals 重新計分決定
+  const localScore = localEstimateScore(lastSignals);
 
   if(localScore>=60){sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');return;}
   if(localScore>=10){
