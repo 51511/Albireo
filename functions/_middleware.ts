@@ -34,11 +34,34 @@ async function sign(msg: string): Promise<string> {
 async function verify(msg: string, sig: string): Promise<boolean> {
   return (await sign(msg)) === sig;
 }
-async function checkPoW(ch: string, nonce: string, resp: string, diff: number): Promise<boolean> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ch + String(nonce)));
+
+// FIX: checkPoW 現在吃 bindInput（signals 摘要），跟 Node 版對齊
+// bindInput 如果事後被竄改，這裡重算出來的雜湊會對不上 resp，PoW 驗證直接失敗
+async function checkPoW(ch: string, nonce: string, resp: string, diff: number, bindInput?: string): Promise<boolean> {
+  const msg = bindInput ? (ch + String(nonce) + '.' + bindInput) : (ch + String(nonce));
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));
   const h = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
   return h === resp && h.startsWith("0".repeat(diff));
 }
+
+// FIX: 把 signals 物件做穩定序列化，固定 key 順序，跟 Node 版 signalsDigestInput 對齊
+// 前端與後端都要用同一套 key 順序與同一套序列化方式，否則雜湊永遠對不上
+const SIGNAL_KEYS = [
+  'webdriver', 'has_cdp_keys', 'webgl_score', 'audio_score', 'fonts_score',
+  'canvas_score', 'consistency_score', 'is_brave', 'is_safari', 'is_firefox_rfp',
+  'fake_brave', 'fake_safari'
+] as const;
+
+function signalsDigestInput(sig: Record<string, unknown>): string {
+  return SIGNAL_KEYS.map(k => `${k}:${JSON.stringify(sig[k] ?? null)}`).join('|');
+}
+
+async function hashSignals(sig: Record<string, unknown>): Promise<string> {
+  const input = signalsDigestInput(sig);
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('').slice(0, 16);
+}
+
 async function generateHoneypotToken(): Promise<string> {
   const ts = Date.now().toString();
   const s  = await sign("honeypot." + ts);
@@ -60,14 +83,10 @@ function safeRedirect(path: string): string {
 }
 
 // ============================================================
-// Tor Exit Node 偵測
-// 使用 Tor Project 官方 DNSEL + in-memory cache
+// Tor Exit Node 偵測（原樣保留，沒問題）
 // ============================================================
-
-// 簡單 in-memory cache，避免同一 IP 重複查詢
-// Cloudflare Workers 每個 isolate 共用，有效降低 DoH 查詢頻率
 const torCache = new Map<string, {result: boolean, ts: number}>();
-const TOR_CACHE_TTL = 10 * 60 * 1000; // 10 分鐘
+const TOR_CACHE_TTL = 10 * 60 * 1000;
 
 async function isTorExitNode(ip: string): Promise<boolean> {
   try {
@@ -75,7 +94,6 @@ async function isTorExitNode(ip: string): Promise<boolean> {
     const parts = ip.split('.');
     if (parts.length !== 4) return false;
 
-    // 查快取
     const cached = torCache.get(ip);
     if (cached && Date.now() - cached.ts < TOR_CACHE_TTL) {
       return cached.result;
@@ -84,7 +102,6 @@ async function isTorExitNode(ip: string): Promise<boolean> {
     const reversed = parts.slice().reverse().join('.');
     const query = `${reversed}.dnsel.torproject.org`;
 
-    // timeout 1秒，失敗放行
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1000);
 
@@ -101,8 +118,42 @@ async function isTorExitNode(ip: string): Promise<boolean> {
     torCache.set(ip, {result: isTor, ts: Date.now()});
     return isTor;
   } catch(e) {
-    return false; // 查詢失敗 → 放行，不誤傷
+    return false;
   }
+}
+
+// ============================================================
+// FIX: 伺服器端重新評分 —— 不信任客戶端算好的 fp_score，
+// 只信任客戶端回報的「原始訊號」，分數邏輯整套搬到伺服器算
+// ============================================================
+function scoreFromSignals(sig: Record<string, any>) {
+  let score = 0;
+  const reasons: string[] = [];
+  const add = (cond: boolean, pts: number, label: string) => {
+    if (cond) { score += pts; reasons.push(label + '=' + pts); }
+  };
+
+  add(sig.webdriver === true, 100, 'webdriver');
+  add(sig.has_cdp_keys === true, 80, 'cdp');
+
+  // 前端已經把 webgl/audio/fonts/canvas/consistency 的「子分數」算好回報，
+  // 伺服器直接加總這些子分數，而不是信任前端算好的總分 fp_score。
+  // 這仍然比 Node 版弱一點（子分數本身還是前端自己判斷），
+  // 但至少把「哪個檢查項目該不該豁免」(isBrave/isSafari/isFirefoxRFP) 的邏輯
+  // 跟「最終要不要擋」的邏輯分開驗證，比單一裸分數更難靠亂填數字繞過
+  const clamp = (n: unknown, max: number) => {
+    const v = typeof n === 'number' && Number.isFinite(n) ? n : 0;
+    return Math.max(0, Math.min(v, max));
+  };
+  add(true, clamp(sig.webgl_score, 60), 'webgl');
+  add(true, clamp(sig.audio_score, 50), 'audio');
+  add(true, clamp(sig.fonts_score, 40), 'fonts');
+  add(true, clamp(sig.canvas_score, 35), 'canvas');
+  add(true, clamp(sig.consistency_score, 125), 'consistency');
+  add(sig.fake_brave === true, 50, 'fake_brave');
+  add(sig.fake_safari === true, 35, 'fake_safari');
+
+  return { score, reasons };
 }
 
 // === HTML ===
@@ -156,12 +207,10 @@ async function detectBrowser() {
   const ua=navigator.userAgent,uaLow=ua.toLowerCase();
   let isBrave=false,fakeBrave=false;
   try {
-    // isBrave() 有時會拋出例外，加 timeout 防止卡住
     const braveCheck = new Promise(resolve => {
       try {
         const r = navigator.brave?.isBrave?.();
         if(r && typeof r.then === 'function') {
-          // 設 500ms timeout，超時視為非 Brave
           const timer = setTimeout(() => resolve(false), 500);
           r.then(v => { clearTimeout(timer); resolve(!!v); }).catch(() => resolve(false));
         } else {
@@ -185,7 +234,6 @@ async function detectBrowser() {
   }
   const isFF=uaLow.includes('firefox');
   const isFirefoxRFP=isFF&&screen.width===1280&&screen.height===900;
-  // Tor 已在 server-side 擋掉，client-side 不再需要偵測
   return{isBrave,isSafari,isFirefoxRFP,isFF,fakeBrave,fakeSafari};
 }
 
@@ -195,13 +243,12 @@ function chkWebGL(isFF){
   try{
     const c=document.createElement('canvas');
     const gl=c.getContext('webgl')||c.getContext('experimental-webgl');
-    if(!gl)return isFF?0:30; // Firefox 沒 WebGL 不扣分
+    if(!gl)return isFF?0:30;
     const ext=gl.getExtension('WEBGL_debug_renderer_info');
     if(!ext)return isFF?0:15;
     const r=(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)||'').toLowerCase();
     const v=(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)||'').toLowerCase();
     const SOFT=['swiftshader','llvmpipe','mesa offscreen','software rasterizer','brian paul','softpipe','angle (google)'];
-    // Firefox 在某些 Android/Linux 裝置上合法使用 llvmpipe，不應扣分
     if(SOFT.some(s=>r.includes(s)))return isFF?0:60;
     if(!v)return isFF?0:20;
     return 0;
@@ -212,7 +259,7 @@ async function chkAudio(exempt,isFF){
   if(exempt)return 0;
   try{
     const AC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
-    if(!AC)return isFF?0:20; // Firefox 沒有 AC 不扣分
+    if(!AC)return isFF?0:20;
     const ctx=new AC(1,44100,44100);
     const osc=ctx.createOscillator(),comp=ctx.createDynamicsCompressor();
     osc.type='triangle';osc.frequency.setValueAtTime(10000,ctx.currentTime);
@@ -223,10 +270,9 @@ async function chkAudio(exempt,isFF){
     const buf=await ctx.startRendering();
     const data=buf.getChannelData(0);
     let sum=0;for(let i=4500;i<5000;i++)sum+=Math.abs(data[i]);
-    // Firefox 的 ETP/RFP 可能讓 sum=0，不應視為 bot
     if(sum===0||isNaN(sum))return isFF?0:50;
     return 0;
-  }catch(e){return isFF?0:15;} // Firefox 拋出例外也不扣分
+  }catch(e){return isFF?0:15;}
 }
 
 function chkFonts(exempt){
@@ -273,9 +319,9 @@ function chkCDP(){
     const keys=['cdc_adoQpoasnfa76pfcZLmcfl_Array','cdc_adoQpoasnfa76pfcZLmcfl_Promise',
       '__webdriver_script_fn','__driver_evaluate','__webdriver_evaluate',
       '__selenium_evaluate','__fxdriver_evaluate','__driver_unwrapped','__webdriver_unwrapped'];
-    if(keys.some(k=>window[k]!==undefined))return 80;
-    return 0;
-  }catch(e){return 0;}
+    if(keys.some(k=>window[k]!==undefined))return true;
+    return false;
+  }catch(e){return false;}
 }
 
 function chkConsistency(isSafari,isFirefoxRFP){
@@ -301,11 +347,24 @@ function chkConsistency(isSafari,isFirefoxRFP){
 
 function chkTiming(t0){
   const ms=Date.now()-t0;
-  if(ms>30000)return 10; // 只擋太慢
+  if(ms>30000)return 10;
   return 0;
 }
 
-let lastScore=0,t0Start=0;
+// FIX: 固定 key 順序的序列化，必須跟伺服器端 signalsDigestInput 完全一致
+const SIGNAL_KEYS=['webdriver','has_cdp_keys','webgl_score','audio_score','fonts_score',
+  'canvas_score','consistency_score','is_brave','is_safari','is_firefox_rfp',
+  'fake_brave','fake_safari'];
+function clientSignalsDigestInput(sig){
+  return SIGNAL_KEYS.map(k=>k+':'+JSON.stringify(sig[k]===undefined?null:sig[k])).join('|');
+}
+async function hashSignalsClient(sig){
+  const input=clientSignalsDigestInput(sig);
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
+}
+
+let lastSignals={},sigDigest='',t0Start=0;
 async function run(){
   const t0=Date.now();t0Start=t0;
   const{isBrave,isSafari,isFirefoxRFP,isFF,fakeBrave,fakeSafari}=await detectBrowser();
@@ -313,21 +372,42 @@ async function run(){
     chkAudio(isBrave||isSafari||isFirefoxRFP,isFF),
     Promise.resolve(chkFonts(isFirefoxRFP)),
   ]);
-  let score=0;const sigs=[];
-  const add=(s,l)=>{if(s>0){score+=s;sigs.push(l+'='+s);}};
-  add(chkWebDriver(),'webdriver');
-  add(chkWebGL(isFF),'webgl');
-  add(audioScore,'audio');
-  if(!isFF)add(fontScore,'fonts'); // Firefox 字型少是正常的，不扣分
-  add(chkCanvas(isBrave||isSafari),'canvas');
-  add(chkCDP(),'cdp');
-  add(chkConsistency(isSafari,isFirefoxRFP),'consistency');
-  add(chkTiming(t0),'timing');
-  if(fakeBrave){score+=50;sigs.push('fake_brave=50');}
-  lastScore=score; // 存給 submit() 用
-  if(fakeSafari){score+=35;sigs.push('fake_safari=35');}
-  if(score>=60){sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');return;}
-  if(score>=10){
+
+  const webglScore=chkWebGL(isFF);
+  const canvasScore=chkCanvas(isBrave||isSafari);
+  const consistencyScore=chkConsistency(isSafari,isFirefoxRFP);
+  const hasCdp=chkCDP();
+  const webdriverFlag=navigator.webdriver===true;
+  const fontsScoreFinal=isFF?0:fontScore;
+
+  // FIX: 送「原始訊號」給伺服器，而不是只送一個 fp_score 總分
+  lastSignals={
+    webdriver: webdriverFlag,
+    has_cdp_keys: hasCdp,
+    webgl_score: webglScore,
+    audio_score: audioScore,
+    fonts_score: fontsScoreFinal,
+    canvas_score: canvasScore,
+    consistency_score: consistencyScore,
+    is_brave: isBrave,
+    is_safari: isSafari,
+    is_firefox_rfp: isFirefoxRFP,
+    fake_brave: fakeBrave,
+    fake_safari: fakeSafari
+  };
+  sigDigest = await hashSignalsClient(lastSignals);
+
+  // 本地也算一次分數，純粹用來決定要不要先跳出 BotD 二次檢查或直接拒絕顯示，
+  // 真正擋不擋人,由伺服器重新計分後決定,這裡的判斷不是最終防線
+  let localScore=0;
+  if(webdriverFlag)localScore+=100;
+  if(hasCdp)localScore+=80;
+  localScore+=webglScore+audioScore+fontsScoreFinal+canvasScore+consistencyScore;
+  if(fakeBrave)localScore+=50;
+  if(fakeSafari)localScore+=35;
+
+  if(localScore>=60){sm('/albireo-dist/img/reject.webp','❌');sd('If verification fails, please try disabling Brave Shields or privacy extensions for this site, then refresh. / 若驗證失敗，請嘗試關閉 Brave Shields 或隱私擴充功能後重新整理。');return;}
+  if(localScore>=10){
     try{
       const Botd=await import('https://openfpcdn.io/botd/v1');
       const botd=await Botd.load();
@@ -338,9 +418,10 @@ async function run(){
   mine();
 }
 
+// FIX: worker 現在吃 sigDigest,混進 PoW 雜湊輸入
 const WC=\`
 async function h(s){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');}
-self.onmessage=async e=>{const{challenge,difficulty,startNonce,step}=e.data;const p="0".repeat(difficulty);let n=startNonce;while(true){const hash=await h(challenge+n);if(hash.startsWith(p)){self.postMessage({nonce:n,hash});return;}n+=step;}};
+self.onmessage=async e=>{const{challenge,difficulty,startNonce,step,sigDigest}=e.data;const p="0".repeat(difficulty);let n=startNonce;const suffix=sigDigest?("."+sigDigest):"";while(true){const hash=await h(challenge+n+suffix);if(hash.startsWith(p)){self.postMessage({nonce:n,hash});return;}n+=step;}};
 \`;
 
 function mine(){
@@ -349,7 +430,7 @@ function mine(){
   const ws=[];let done=false;
   for(let i=0;i<n;i++){
     const w=new Worker(URL.createObjectURL(new Blob([WC],{type:'application/javascript'})));
-    ws.push(w);w.postMessage({challenge:CHALLENGE,difficulty:DIFFICULTY,startNonce:i,step:n});
+    ws.push(w);w.postMessage({challenge:CHALLENGE,difficulty:DIFFICULTY,startNonce:i,step:n,sigDigest:sigDigest});
     w.onmessage=e=>{if(done)return;done=true;ws.forEach(x=>x.terminate());submit(e.data.nonce,e.data.hash);};
   }
 }
@@ -359,7 +440,8 @@ function submit(nonce,response){
   const fd=new FormData();
   fd.append('nonce',String(nonce));fd.append('response',response);
   fd.append('verify','true');fd.append('original_path',ORIG);
-  fd.append('fp_score',String(lastScore));fd.append('fp_nonce',FP_NONCE);
+  // FIX: 送原始 signals JSON，不送裸分數
+  fd.append('signals',JSON.stringify(lastSignals));fd.append('fp_nonce',FP_NONCE);
   fd.append('elapsed',String(Date.now()-t0Start));
   fetch(window.location.href,{method:'POST',body:fd})
     .then(async r=>{
@@ -398,23 +480,16 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   const ua=(request.headers.get("User-Agent")||"").toLowerCase();
   const cookie=request.headers.get("Cookie")||"";
 
-  // 靜態資源
   if(url.pathname.match(/\.(png|jpg|jpeg|gif|webp|css|js|ico|svg|json|xml|rss|atom)$/)||
      url.pathname.startsWith("/albireo-dist/")) return next();
 
-  // SEO bots
   if(BOT_AGENTS.some(b=>ua.includes(b))) return next();
 
-  // ============================================================
-  // Tor Exit Node 檢查（server-side，無法偽造）
-  // CF-Connecting-IP 是 Cloudflare 加的，client 無法竄改
-  // ============================================================
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
   if(clientIP && await isTorExitNode(clientIP)){
     return new Response("Forbidden", { status: 403 });
   }
 
-  // Server-side suspicion scoring
   let sus=0;
   const BOTS=["bot","crawler","spider","scraper","scrapy","python-requests","go-http-client","curl","wget","libwww","httpx"];
   if(BOTS.some(p=>ua.includes(p)))            sus+=10;
@@ -426,7 +501,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
   const serverDiff=sus===0?1:DIFFICULTY;
 
-  // Honeypot 路徑
   if(url.pathname.startsWith(HONEYPOT_PREFIX)){
     const token=url.pathname.slice(HONEYPOT_PREFIX.length);
     if(await verifyHoneypotToken(token)){
@@ -437,10 +511,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     return new Response("Not Found",{status:404});
   }
 
-  // Bot 黑名單
   if(cookie.includes("albireo_bot=true")) return new Response("Forbidden",{status:403});
 
-  // Solved cookie
   const solvedStr=cookie.split(';').find(c=>c.trim().startsWith('albireo_solved='));
   if(solvedStr){
     const val=decodeURIComponent(solvedStr.split('=')[1].trim());
@@ -466,7 +538,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     return new Response(null,{status:302,headers:h});
   }
 
-  // POST: PoW 驗證
+  // POST: PoW + 訊號驗證
   if(request.method==="POST"){
     try{
       const fd=await request.formData();
@@ -478,28 +550,37 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       if(!cStr)return new Response("Expired",{status:403});
       const cv=decodeURIComponent(cStr.split('=')[1].trim());
       const parts=cv.split('.');
-      if(parts.length!==5)return new Response("Invalid Challenge",{status:403}); // FIX: 5 段
+      if(parts.length!==5)return new Response("Invalid Challenge",{status:403});
       const[ch,ts,diffStr,cookieFpNonce,sig]=parts;
-      // FIX: 簽名涵蓋 fp_nonce
       if(!await verify(ch+'.'+ts+'.'+diffStr+'.'+cookieFpNonce,sig))return new Response("Invalid Signature",{status:403});
       const issued=parseInt(ts,10);
       if(isNaN(issued)||Date.now()-issued>CHALLENGE_TTL)return new Response("Challenge Expired",{status:403});
       const diff=parseInt(diffStr,10);
       if(isNaN(diff)||diff<1)return new Response("Invalid Difficulty",{status:403});
-      if(!await checkPoW(ch,nonce,resp,diff))return new Response("POW Failed",{status:403});
-      // FIX: 驗 fp_nonce（確認 JS 有跑、不是直接 POST）
+
+      // FIX: 解析客戶端回報的「原始訊號」，不是分數
+      let parsedSignals: Record<string, any> = {};
+      try { parsedSignals = JSON.parse((fd.get("signals") as string) || "{}"); }
+      catch (e) { return new Response("Invalid Signals", {status:400}); }
+
+      // FIX: 把 signals 雜湊後當成 PoW 的綁定輸入
+      // 客戶端挖礦時用的 sigDigest 必須跟這裡重算出來的一致，
+      // 事後竄改 signals 會讓這裡算出不同摘要，PoW 核驗失敗
+      const sigDigest = await hashSignals(parsedSignals);
+      const ok = await checkPoW(ch, nonce, resp, diff, sigDigest);
+      if (!ok) return new Response("POW Failed", {status:403});
+
       const clientFpNonce=fd.get("fp_nonce") as string||"";
       if(clientFpNonce!==cookieFpNonce)return new Response("Fingerprint Token Mismatch",{status:403});
-      // FIX: 驗 fp_score（爬蟲如實回報高分就擋）
-      const fpScore=parseInt(fd.get("fp_score") as string||"0",10);
-      if(fpScore>=60)return new Response("Bot Detected",{status:403});
-      // FIX: elapsedTime 驗證
-      // 真實瀏覽器跑指紋偵測至少需要 300ms
-      // 太快代表沒跑 JS 直接 POST
+
+      // FIX: 伺服器自己重新計分，不信任任何前端送來的總分欄位
+      const { score, reasons } = scoreFromSignals(parsedSignals);
+      if (score >= 60) return new Response("Bot Detected", {status:403});
+
       const elapsed=parseInt(fd.get("elapsed") as string||"0",10);
       if(isNaN(elapsed)||elapsed<10)return new Response("Too Fast",{status:403});
-      // 太慢也可疑（超過 5 分鐘，challenge 幾乎過期）
       if(elapsed>CHALLENGE_TTL)return new Response("Too Slow",{status:403});
+
       const sts=Date.now().toString();
       const rs=await sign("solved."+sts);
       const ss2=rs.replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
@@ -515,8 +596,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   const rnd=crypto.randomUUID().replace(/-/g,'');
   const ts=Date.now().toString();
   const ds=serverDiff.toString();
-  const fpNonce=crypto.randomUUID().replace(/-/g,''); // FIX: session-bound fp_nonce
-  const payload=rnd+'.'+ts+'.'+ds+'.'+fpNonce;       // FIX: 5 段，含 fp_nonce
+  const fpNonce=crypto.randomUUID().replace(/-/g,'');
+  const payload=rnd+'.'+ts+'.'+ds+'.'+fpNonce;
   const sig=await sign(payload);
   const orig=safeRedirect(url.pathname+url.search+url.hash);
   const trap=await generateHoneypotToken();
@@ -524,7 +605,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   h.set("Content-Type","text/html");
   h.set("Cache-Control","private,no-cache,no-store,must-revalidate");
   h.set("Set-Cookie",`albireo_challenge=${encodeURIComponent(payload+'.'+sig)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
-  const html=GENERATE_HTML(rnd,orig,serverDiff,fpNonce); // FIX: 傳 fpNonce 給 HTML
+  const html=GENERATE_HTML(rnd,orig,serverDiff,fpNonce);
   const injected=html.replace("</body>",
     `<div aria-hidden="true" style="position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;"><a href="${HONEYPOT_PREFIX+trap}" rel="nofollow" tabindex="-1">.</a></div></body>`
   );
